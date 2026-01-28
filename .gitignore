@@ -1,0 +1,63 @@
+# Dependencies
+node_modules/
+package-lock.json
+bun.lock
+
+# Build outputs
+dist/
+*.tsbuildinfo
+
+# Runtime data
+*.log
+logs/
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# Development data
+datasets/
+private/
+plugin/data/
+plugin/data.backup/
+
+# IDE and editor
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Bun
+.bun-path
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+.install-version
+
+# Claude Code local settings
+.claude/settings.local.json
+.claude/agents/
+.claude/skills/
+
+# Generated UI files (built from viewer-template.html)
+src/ui/viewer.html
+
+# Local MCP server config (for development only)
+.mcp.json
+
+# Prevent literal tilde directories (path validation bug artifacts)
+~*/
+
+# Prevent other malformed path directories
+http*/
+https*/
