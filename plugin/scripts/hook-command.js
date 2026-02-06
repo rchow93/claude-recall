@@ -1117,230 +1117,102 @@ function getProjectContext(cwd) {
 }
 
 // src/cli/handlers/context.ts
-var MAX_CONTEXT_CHARS = 16e3;
-var MAX_RECOVERY_CHARS = 48e3;
-function formatObservationCompact(obs) {
-  const tool = obs.tool_name;
-  let input = obs.tool_input;
-  try {
-    input = JSON.parse(input ?? "");
-  } catch {
-  }
-  switch (tool) {
-    case "Write":
-    case "Read":
-    case "Edit":
-      return `${tool}: ${input?.file_path ?? input ?? "(unknown)"}`;
-    case "Bash": {
-      const cmd = input?.command ?? input ?? "";
-      const cmdStr = typeof cmd === "string" ? cmd : JSON.stringify(cmd);
-      return `Bash: ${cmdStr.slice(0, 200)}`;
-    }
-    case "Glob":
-      return `Glob: ${input?.pattern ?? input ?? ""}`;
-    case "Grep":
-      return `Grep: ${input?.pattern ?? input ?? ""}`;
-    case "Task":
-      return `Task: ${input?.description ?? input?.subagent_type ?? "(agent)"}`;
-    default: {
-      const summary = typeof input === "string" ? input.slice(0, 120) : JSON.stringify(input).slice(0, 120);
-      return `${tool}: ${summary}`;
-    }
-  }
-}
-function formatObservationDetailed(obs) {
-  const tool = obs.tool_name;
-  let input = obs.tool_input;
-  try {
-    input = JSON.parse(input ?? "");
-  } catch {
-  }
-  const resp = obs.tool_response ?? "";
-  const respPreview = resp.length > 500 ? resp.slice(0, 500) + "..." : resp;
-  switch (tool) {
-    case "Write":
-      return `**Write** \`${input?.file_path ?? "?"}\`
-  Content: ${(input?.content ?? "").slice(0, 300)}${(input?.content?.length ?? 0) > 300 ? "..." : ""}`;
-    case "Read":
-      return `**Read** \`${input?.file_path ?? "?"}\``;
-    case "Edit":
-      return `**Edit** \`${input?.file_path ?? "?"}\`
-  old: \`${(input?.old_string ?? "").slice(0, 150)}\`
-  new: \`${(input?.new_string ?? "").slice(0, 150)}\``;
-    case "Bash": {
-      const cmd = input?.command ?? input ?? "";
-      const cmdStr = typeof cmd === "string" ? cmd : JSON.stringify(cmd);
-      return `**Bash** \`${cmdStr.slice(0, 300)}\`
-  Output: ${respPreview}`;
-    }
-    case "Glob":
-      return `**Glob** \`${input?.pattern ?? ""}\`
-  Results: ${respPreview.slice(0, 300)}`;
-    case "Grep":
-      return `**Grep** \`${input?.pattern ?? ""}\` in ${input?.path ?? "."}
-  Results: ${respPreview.slice(0, 300)}`;
-    case "Task":
-      return `**Task** ${input?.description ?? input?.subagent_type ?? "(agent)"}
-  Result: ${respPreview.slice(0, 300)}`;
-    default: {
-      const summary = typeof input === "string" ? input.slice(0, 200) : JSON.stringify(input).slice(0, 200);
-      return `**${tool}** ${summary}`;
-    }
-  }
-}
-function buildRecoveryContext(db, crashedSession, charBudget) {
-  const sid = crashedSession.content_session_id;
+var MAX_SUMMARY_CHARS = 8e3;
+function buildCompactSummary(db, session) {
+  const sid = session.content_session_id;
   const prompts = db.prepare(
-    `SELECT content_session_id, prompt_number, prompt_text, created_at, created_at_epoch
-     FROM user_prompts
-     WHERE content_session_id = ?
-     ORDER BY prompt_number ASC`
+    `SELECT prompt_number, prompt_text FROM user_prompts
+     WHERE content_session_id = ? ORDER BY prompt_number ASC`
   ).all(sid);
   const observations = db.prepare(
-    `SELECT id, content_session_id, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch
+    `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number
      FROM raw_observations
-     WHERE content_session_id = ?
+     WHERE content_session_id = ? AND tool_name != '_assistant_responses'
      ORDER BY id ASC`
   ).all(sid);
-  const regularObs = [];
-  const assistantResponsesByPrompt = /* @__PURE__ */ new Map();
-  for (const o of observations) {
-    if (o.tool_name === "_assistant_responses") {
-      try {
-        const responses = JSON.parse(o.tool_response ?? "[]");
-        for (const r of responses) {
-          if (!assistantResponsesByPrompt.has(r.prompt_number)) {
-            assistantResponsesByPrompt.set(r.prompt_number, r.text);
-          }
-        }
-      } catch {
-      }
-    } else {
-      regularObs.push(o);
+  const assistantRow = db.prepare(
+    `SELECT tool_response FROM raw_observations
+     WHERE content_session_id = ? AND tool_name = '_assistant_responses'
+     ORDER BY id DESC LIMIT 1`
+  ).get(sid);
+  let assistantResponses = [];
+  if (assistantRow?.tool_response) {
+    try {
+      assistantResponses = JSON.parse(assistantRow.tool_response);
+    } catch {
     }
   }
-  const obsByPrompt = /* @__PURE__ */ new Map();
-  for (const o of regularObs) {
-    const pn = o.prompt_number ?? 0;
-    if (!obsByPrompt.has(pn)) obsByPrompt.set(pn, []);
-    obsByPrompt.get(pn).push(o);
+  const assistantByPrompt = /* @__PURE__ */ new Map();
+  for (const r of assistantResponses) {
+    assistantByPrompt.set(r.prompt_number, r.text);
   }
-  const allPromptNums = /* @__PURE__ */ new Set();
-  for (const p of prompts) allPromptNums.add(p.prompt_number);
-  for (const pn of obsByPrompt.keys()) allPromptNums.add(pn);
-  for (const pn of assistantResponsesByPrompt.keys()) allPromptNums.add(pn);
-  const sortedNums = [...allPromptNums].sort((a, b) => a - b);
-  const promptByNum = /* @__PURE__ */ new Map();
-  for (const p of prompts) promptByNum.set(p.prompt_number, p);
+  const filesTouched = /* @__PURE__ */ new Set();
+  const commandsRun = [];
+  for (const o of observations) {
+    let input = o.tool_input;
+    try {
+      input = JSON.parse(input ?? "");
+    } catch {
+    }
+    if (["Read", "Write", "Edit"].includes(o.tool_name) && input?.file_path) {
+      filesTouched.add(input.file_path);
+    }
+    if (o.tool_name === "Bash" && input?.command) {
+      const cmd = typeof input.command === "string" ? input.command : JSON.stringify(input.command);
+      commandsRun.push(cmd.slice(0, 120));
+    }
+  }
+  const statusLabel = session.status === "active" ? "interrupted" : "completed";
   const lines = [];
-  const statusLabel = crashedSession.status === "active" ? "interrupted" : "completed";
-  lines.push(`# Previous Session \u2014 ${crashedSession.project}`);
-  lines.push(`Last session (${statusLabel}, started ${crashedSession.started_at}, ${crashedSession.prompt_counter} prompts, ${regularObs.length} tool uses).`);
-  lines.push(`Full reconstruction below so you can continue where the user left off.
+  lines.push(`# Previous Session \u2014 ${session.project}`);
+  lines.push(`Status: ${statusLabel} | Started: ${session.started_at} | ${session.prompt_counter} prompts, ${observations.length} tool uses`);
+  lines.push(`Use MCP tools (search, timeline, get_observations) for full details.
 `);
   let used = lines.join("\n").length;
-  for (const pn of sortedNums) {
-    if (used > charBudget - 200) {
-      lines.push("\n...[context truncated \u2014 use MCP search/get_observations for more detail]");
-      break;
-    }
-    const prompt = promptByNum.get(pn);
-    if (prompt) {
-      const promptText = prompt.prompt_text.length > 2e3 ? prompt.prompt_text.slice(0, 2e3) + "..." : prompt.prompt_text;
-      const pLine = `
-## Prompt ${pn}
-> ${promptText.replace(/\n/g, "\n> ")}
+  for (const p of prompts) {
+    if (used > MAX_SUMMARY_CHARS - 200) break;
+    const promptSnippet = p.prompt_text.length > 300 ? p.prompt_text.slice(0, 300) + "..." : p.prompt_text;
+    const pLine = `## Prompt ${p.prompt_number}
+> ${promptSnippet.replace(/\n/g, " ")}
 `;
-      lines.push(pLine);
-      used += pLine.length;
-    }
-    const obs = obsByPrompt.get(pn);
-    if (obs && obs.length > 0) {
-      for (const o of obs) {
-        if (used > charBudget - 200) break;
-        const oLine = `- ${formatObservationDetailed(o)}
+    lines.push(pLine);
+    used += pLine.length;
+    const resp = assistantByPrompt.get(p.prompt_number);
+    if (resp && used < MAX_SUMMARY_CHARS - 200) {
+      const respSnippet = resp.length > 400 ? resp.slice(0, 400) + "..." : resp;
+      const rLine = `**Claude:** ${respSnippet.replace(/\n/g, " ")}
 `;
-        lines.push(oLine);
-        used += oLine.length;
-      }
+      lines.push(rLine);
+      used += rLine.length;
     }
-    const assistantText = assistantResponsesByPrompt.get(pn);
-    if (assistantText && used < charBudget - 200) {
-      const cappedText = assistantText.length > 1500 ? assistantText.slice(0, 1500) + "..." : assistantText;
-      const aLine = `
-**Claude's response:**
-${cappedText}
+  }
+  if (filesTouched.size > 0 && used < MAX_SUMMARY_CHARS - 200) {
+    const fileList = [...filesTouched].slice(0, 15);
+    lines.push(`
+### Files touched (${filesTouched.size}):`);
+    for (const f of fileList) {
+      const fLine = `- ${f}
 `;
-      lines.push(aLine);
-      used += aLine.length;
+      lines.push(fLine);
+      used += fLine.length;
+      if (used > MAX_SUMMARY_CHARS - 100) break;
+    }
+    if (filesTouched.size > 15) lines.push(`- ...and ${filesTouched.size - 15} more
+`);
+  }
+  if (commandsRun.length > 0 && used < MAX_SUMMARY_CHARS - 200) {
+    const cmds = commandsRun.slice(0, 8);
+    lines.push(`
+### Commands run (${commandsRun.length}):`);
+    for (const c of cmds) {
+      const cLine = `- \`${c}\`
+`;
+      lines.push(cLine);
+      used += cLine.length;
+      if (used > MAX_SUMMARY_CHARS - 100) break;
     }
   }
   return lines.join("\n").trim();
-}
-function buildNormalContext(db, sessions, charBudget) {
-  const sessionIds = sessions.map((s) => s.content_session_id);
-  const sessionPlaceholders = sessionIds.map(() => "?").join(",");
-  const observations = db.prepare(
-    `SELECT id, content_session_id, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch
-     FROM raw_observations
-     WHERE content_session_id IN (${sessionPlaceholders})
-     ORDER BY created_at_epoch DESC
-     LIMIT 50`
-  ).all(...sessionIds);
-  const prompts = db.prepare(
-    `SELECT content_session_id, prompt_number, prompt_text, created_at, created_at_epoch
-     FROM user_prompts
-     WHERE content_session_id IN (${sessionPlaceholders})
-     ORDER BY created_at_epoch DESC
-     LIMIT 20`
-  ).all(...sessionIds);
-  const sessionMap = /* @__PURE__ */ new Map();
-  for (const s of sessions) {
-    sessionMap.set(s.content_session_id, { prompts: [], observations: [] });
-  }
-  for (const p of prompts) {
-    sessionMap.get(p.content_session_id)?.prompts.push(p);
-  }
-  for (const o of observations) {
-    sessionMap.get(o.content_session_id)?.observations.push(o);
-  }
-  const lines = [];
-  lines.push("# Recent Session Activity\n");
-  let remaining = charBudget;
-  const sessionBudgets = sessions.map((_, i) => i === 0 ? 0.6 : 0.4 / (sessions.length - 1 || 1));
-  for (let i = 0; i < sessions.length && remaining > 500; i++) {
-    const s = sessions[i];
-    const data = sessionMap.get(s.content_session_id);
-    if (!data) continue;
-    const budget = Math.floor(charBudget * sessionBudgets[i]);
-    let used = 0;
-    const statusTag = s.status === "completed" ? " (completed)" : "";
-    const header = `## Session: ${s.project}${statusTag} - ${s.started_at}
-`;
-    lines.push(header);
-    used += header.length;
-    for (const p of data.prompts.slice(0, 3)) {
-      if (used > budget) break;
-      const line = `- Prompt #${p.prompt_number}: ${p.prompt_text.slice(0, 200)}
-`;
-      lines.push(line);
-      used += line.length;
-    }
-    if (data.observations.length > 0) {
-      lines.push("### Tool Activity:\n");
-      used += 20;
-      for (const obs of data.observations) {
-        if (used > budget) break;
-        const line = `- ${formatObservationCompact(obs)}
-`;
-        lines.push(line);
-        used += line.length;
-      }
-    }
-    lines.push("");
-    remaining -= used;
-  }
-  return lines.join("").trim();
 }
 var contextHandler = {
   async execute(input) {
@@ -1365,10 +1237,9 @@ var contextHandler = {
           }
         };
       }
-      const mostRecent = sessions[0];
-      const additionalContext = mostRecent.prompt_counter > 0 ? buildRecoveryContext(db, mostRecent, MAX_RECOVERY_CHARS) : buildNormalContext(db, sessions, MAX_CONTEXT_CHARS);
+      const mostRecent = sessions.find((s) => s.prompt_counter > 0) ?? sessions[0];
+      const additionalContext = mostRecent.prompt_counter > 0 ? buildCompactSummary(db, mostRecent) : "";
       logger.debug("HOOK", "Context generated", {
-        mode: mostRecent.prompt_counter > 0 ? "full" : "summary",
         sessions: sessions.length,
         contextLength: additionalContext.length
       });
@@ -1430,11 +1301,14 @@ var sessionInitHandler = {
 };
 
 // src/cli/handlers/observation.ts
+import { readFileSync as readFileSync3 } from "fs";
 var MAX_RESPONSE_BYTES = 1e4;
 var MAX_INPUT_BYTES = 1e4;
 var MAX_DB_PAGES = 2621440;
 var CLEANUP_PROBABILITY = 0.01;
 var CLEANUP_BATCH_PERCENT = 0.1;
+var TRANSCRIPT_CAPTURE_INTERVAL = 600;
+var MAX_ASSISTANT_RESPONSE_CHARS = 1e4;
 function truncateStr(s, maxLen) {
   if (s == null) return null;
   if (s.length <= maxLen) return s;
@@ -1445,9 +1319,58 @@ function stringify(val) {
   if (typeof val === "string") return val;
   return JSON.stringify(val);
 }
+function extractText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.filter((block) => block.type === "text" && typeof block.text === "string").map((block) => block.text).join("\n");
+  }
+  return "";
+}
+function captureTranscript(db, sessionId, project, cwd, transcriptPath, nowEpoch) {
+  let data;
+  try {
+    data = readFileSync3(transcriptPath, "utf-8");
+  } catch {
+    return;
+  }
+  const lines = data.split("\n").filter((l) => l.trim());
+  const responses = [];
+  let promptNumber = 0;
+  for (const line of lines) {
+    try {
+      const msg = JSON.parse(line);
+      const role = msg.role ?? msg.message?.role;
+      if (role === "user") promptNumber++;
+      if (role === "assistant") {
+        const content = msg.content ?? msg.message?.content;
+        const text = extractText(content);
+        if (text.trim()) {
+          responses.push({
+            prompt_number: promptNumber,
+            text: text.length > MAX_ASSISTANT_RESPONSE_CHARS ? text.slice(0, MAX_ASSISTANT_RESPONSE_CHARS) + "...[truncated]" : text
+          });
+        }
+      }
+    } catch {
+    }
+  }
+  if (responses.length === 0) return;
+  const responsesJson = JSON.stringify(responses);
+  const capped = responsesJson.length > 5e4 ? responsesJson.slice(0, 5e4) + "...[truncated]" : responsesJson;
+  db.run(
+    `DELETE FROM raw_observations WHERE content_session_id = ? AND tool_name = '_assistant_responses'`,
+    [sessionId]
+  );
+  db.run(
+    `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch)
+     VALUES (?, ?, '_assistant_responses', NULL, ?, ?, ?, ?, ?)`,
+    [sessionId, project, capped, cwd, promptNumber, (/* @__PURE__ */ new Date()).toISOString(), nowEpoch]
+  );
+  logger.debug("HOOK", `Captured ${responses.length} assistant responses from transcript`);
+}
 var observationHandler = {
   async execute(input) {
-    const { sessionId, cwd, toolName, toolInput, toolResponse } = input;
+    const { sessionId, cwd, toolName, toolInput, toolResponse, transcriptPath } = input;
     if (!toolName) {
       throw new Error("observationHandler requires toolName");
     }
@@ -1475,6 +1398,17 @@ var observationHandler = {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [sessionId, project, toolName, inputStr, responseStr, cwd, promptNumber, now.toISOString(), nowEpoch]
       );
+      if (transcriptPath) {
+        const lastCapture = db.prepare(
+          `SELECT created_at_epoch FROM raw_observations
+           WHERE content_session_id = ? AND tool_name = '_assistant_responses'
+           ORDER BY id DESC LIMIT 1`
+        ).get(sessionId);
+        const sinceLastCapture = lastCapture ? nowEpoch - lastCapture.created_at_epoch : Infinity;
+        if (sinceLastCapture >= TRANSCRIPT_CAPTURE_INTERVAL) {
+          captureTranscript(db, sessionId, project, cwd, transcriptPath, nowEpoch);
+        }
+      }
       if (Math.random() < CLEANUP_PROBABILITY) {
         const pageCount = db.prepare("PRAGMA page_count").get()?.page_count ?? 0;
         if (pageCount > MAX_DB_PAGES) {
@@ -1500,9 +1434,9 @@ var observationHandler = {
 };
 
 // src/cli/handlers/summarize.ts
-import { readFileSync as readFileSync3 } from "fs";
+import { readFileSync as readFileSync4 } from "fs";
 var MAX_RESPONSE_CHARS = 1e4;
-function extractText(content) {
+function extractText2(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content.filter((block) => block.type === "text" && typeof block.text === "string").map((block) => block.text).join("\n");
@@ -1517,7 +1451,7 @@ var summarizeHandler = {
     }
     let transcriptData;
     try {
-      transcriptData = readFileSync3(transcriptPath, "utf-8");
+      transcriptData = readFileSync4(transcriptPath, "utf-8");
     } catch (err) {
       logger.debug("HOOK", `Could not read transcript: ${err}`);
       return { continue: true, suppressOutput: true };
@@ -1537,7 +1471,7 @@ var summarizeHandler = {
         }
         if (role === "assistant") {
           const content = msg.content ?? msg.message?.content;
-          const text = extractText(content);
+          const text = extractText2(content);
           if (text.trim()) {
             assistantResponses.push(JSON.stringify({
               prompt_number: promptNumber,
@@ -1579,7 +1513,7 @@ import { basename as basename2 } from "path";
 // src/shared/worker-utils.ts
 import path2 from "path";
 import { homedir as homedir4 } from "os";
-import { readFileSync as readFileSync4 } from "fs";
+import { readFileSync as readFileSync5 } from "fs";
 
 // src/shared/hook-constants.ts
 var HOOK_TIMEOUTS = {
@@ -1659,7 +1593,7 @@ async function isWorkerHealthy() {
 }
 function getPluginVersion() {
   const packageJsonPath = path2.join(MARKETPLACE_ROOT, "package.json");
-  const packageJson = JSON.parse(readFileSync4(packageJsonPath, "utf-8"));
+  const packageJson = JSON.parse(readFileSync5(packageJsonPath, "utf-8"));
   return packageJson.version;
 }
 async function getWorkerVersion() {
