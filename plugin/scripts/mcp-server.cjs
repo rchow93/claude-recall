@@ -21714,6 +21714,54 @@ function openDatabase(dbPath = DB_PATH) {
   return db2;
 }
 
+// src/utils/date-parse.ts
+function parseDateExpression(expr) {
+  if (expr == null) return null;
+  if (typeof expr === "number") {
+    if (!isFinite(expr) || expr <= 0) return null;
+    return expr > 1e12 ? Math.floor(expr / 1e3) : Math.floor(expr);
+  }
+  const s = expr.trim().toLowerCase();
+  if (!s) return null;
+  const now = Math.floor(Date.now() / 1e3);
+  if (s === "now") return now;
+  if (s === "today") return midnightOffsetDays(0);
+  if (s === "yesterday") return midnightOffsetDays(-1);
+  if (s === "tomorrow") return midnightOffsetDays(1);
+  const relMatch = s.match(/^(\d+)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|wk|wks|week|weeks|mo|mon|month|months)\s*ago$/);
+  if (relMatch) {
+    const n = parseInt(relMatch[1], 10);
+    const unit = relMatch[2];
+    const secs = unitToSeconds(unit, n);
+    if (secs !== null) return now - secs;
+  }
+  const lastMatch = s.match(/^last\s+(hour|day|week|month)$/);
+  if (lastMatch) {
+    const secs = unitToSeconds(lastMatch[1], 1);
+    if (secs !== null) return now - secs;
+  }
+  const parsed = Date.parse(expr);
+  if (!isNaN(parsed)) {
+    return Math.floor(parsed / 1e3);
+  }
+  return null;
+}
+function unitToSeconds(unit, n) {
+  if (/^(s|sec|secs|second|seconds)$/.test(unit)) return n;
+  if (/^(m|min|mins|minute|minutes)$/.test(unit)) return n * 60;
+  if (/^(h|hr|hrs|hour|hours)$/.test(unit)) return n * 3600;
+  if (/^(d|day|days)$/.test(unit)) return n * 86400;
+  if (/^(w|wk|wks|week|weeks)$/.test(unit)) return n * 7 * 86400;
+  if (/^(mo|mon|month|months)$/.test(unit)) return n * 30 * 86400;
+  return null;
+}
+function midnightOffsetDays(offset) {
+  const d = /* @__PURE__ */ new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + offset);
+  return Math.floor(d.getTime() / 1e3);
+}
+
 // src/servers/mcp-server.ts
 var packageVersion = typeof __DEFAULT_PACKAGE_VERSION__ !== "undefined" ? __DEFAULT_PACKAGE_VERSION__ : "0.0.0-dev";
 var _originalLog = console["log"];
@@ -21750,138 +21798,46 @@ function handleSearch(args) {
   const limit = Math.min(Number(args.limit) || 20, 100);
   const project = args.cross_project ? void 0 : args.project;
   const offset = Number(args.offset) || 0;
+  const since = args.since != null ? parseDateExpression(args.since) : null;
+  const until = args.until != null ? parseDateExpression(args.until) : null;
+  if (args.since != null && since == null) {
+    return { content: [{ type: "text", text: `Could not parse 'since': "${args.since}". Try formats like "3 days ago", "yesterday", "2026-04-25", or epoch seconds.` }] };
+  }
+  if (args.until != null && until == null) {
+    return { content: [{ type: "text", text: `Could not parse 'until': "${args.until}". Try formats like "3 days ago", "yesterday", "2026-04-25", or epoch seconds.` }] };
+  }
   const results = [];
-  if (query.trim()) {
-    const ftsQuery = query.split(/\s+/).map((term) => `"${term.replace(/"/g, "")}"`).join(" ");
+  const hasQuery = !!query.trim();
+  const ftsQuery = hasQuery ? query.split(/\s+/).map((term) => `"${term.replace(/"/g, "")}"`).join(" ") : "";
+  const likePattern = hasQuery ? `%${query}%` : "";
+  let rawAdded = false;
+  if (hasQuery) {
     try {
-      if (project) {
-        const rawResults = cachedPrepare(
-          `SELECT r.id, 'raw' as source, r.content_session_id, r.project, r.tool_name,
-                  NULL as title, NULL as type, r.created_at, r.created_at_epoch
-           FROM raw_observations r
-           JOIN raw_observations_fts f ON r.id = f.rowid
-           WHERE raw_observations_fts MATCH ? AND r.project = ?
-           ORDER BY r.created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(ftsQuery, project, limit, offset);
-        results.push(...rawResults);
-      } else {
-        const rawResults = cachedPrepare(
-          `SELECT r.id, 'raw' as source, r.content_session_id, r.project, r.tool_name,
-                  NULL as title, NULL as type, r.created_at, r.created_at_epoch
-           FROM raw_observations r
-           JOIN raw_observations_fts f ON r.id = f.rowid
-           WHERE raw_observations_fts MATCH ?
-           ORDER BY r.created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(ftsQuery, limit, offset);
-        results.push(...rawResults);
-      }
+      const { sql, params } = buildRawSearchSql({ mode: "fts", project, since, until, limit, offset, ftsQuery });
+      const rows = cachedPrepare(sql).all(...params);
+      results.push(...rows);
+      rawAdded = true;
     } catch {
-      const likePattern = `%${query}%`;
-      if (project) {
-        const rawResults = cachedPrepare(
-          `SELECT id, 'raw' as source, content_session_id, project, tool_name,
-                  NULL as title, NULL as type, created_at, created_at_epoch
-           FROM raw_observations
-           WHERE (tool_name LIKE ? OR tool_input LIKE ?) AND project = ?
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(likePattern, likePattern, project, limit, offset);
-        results.push(...rawResults);
-      } else {
-        const rawResults = cachedPrepare(
-          `SELECT id, 'raw' as source, content_session_id, project, tool_name,
-                  NULL as title, NULL as type, created_at, created_at_epoch
-           FROM raw_observations
-           WHERE (tool_name LIKE ? OR tool_input LIKE ?)
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(likePattern, likePattern, limit, offset);
-        results.push(...rawResults);
-      }
-    }
-  } else {
-    if (project) {
-      const rawResults = cachedPrepare(
-        `SELECT id, 'raw' as source, content_session_id, project, tool_name,
-                NULL as title, NULL as type, created_at, created_at_epoch
-         FROM raw_observations WHERE project = ?
-         ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-      ).all(project, limit, offset);
-      results.push(...rawResults);
-    } else {
-      const rawResults = cachedPrepare(
-        `SELECT id, 'raw' as source, content_session_id, project, tool_name,
-                NULL as title, NULL as type, created_at, created_at_epoch
-         FROM raw_observations
-         ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-      ).all(limit, offset);
-      results.push(...rawResults);
     }
   }
+  if (!rawAdded) {
+    const mode = hasQuery ? "like" : "none";
+    const { sql, params } = buildRawSearchSql({ mode, project, since, until, limit, offset, likePattern });
+    const rows = cachedPrepare(sql).all(...params);
+    results.push(...rows);
+  }
   try {
-    if (query.trim()) {
-      const likePattern = `%${query}%`;
-      if (project) {
-        const legacyResults = cachedPrepare(
-          `SELECT id, 'legacy' as source, COALESCE(memory_session_id, '') as content_session_id,
-                  project, NULL as tool_name, title, type, created_at, created_at_epoch
-           FROM observations
-           WHERE (title LIKE ? OR text LIKE ? OR narrative LIKE ?) AND project = ?
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(likePattern, likePattern, likePattern, project, Math.floor(limit / 2), offset);
-        results.push(...legacyResults);
-      } else {
-        const legacyResults = cachedPrepare(
-          `SELECT id, 'legacy' as source, COALESCE(memory_session_id, '') as content_session_id,
-                  project, NULL as tool_name, title, type, created_at, created_at_epoch
-           FROM observations
-           WHERE (title LIKE ? OR text LIKE ? OR narrative LIKE ?)
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(likePattern, likePattern, likePattern, Math.floor(limit / 2), offset);
-        results.push(...legacyResults);
-      }
-    } else {
-      if (project) {
-        const legacyResults = cachedPrepare(
-          `SELECT id, 'legacy' as source, COALESCE(memory_session_id, '') as content_session_id,
-                  project, NULL as tool_name, title, type, created_at, created_at_epoch
-           FROM observations WHERE project = ?
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(project, Math.floor(limit / 2), offset);
-        results.push(...legacyResults);
-      } else {
-        const legacyResults = cachedPrepare(
-          `SELECT id, 'legacy' as source, COALESCE(memory_session_id, '') as content_session_id,
-                  project, NULL as tool_name, title, type, created_at, created_at_epoch
-           FROM observations
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(Math.floor(limit / 2), offset);
-        results.push(...legacyResults);
-      }
-    }
+    const legacyLimit = Math.floor(limit / 2);
+    const { sql, params } = buildLegacySearchSql({ hasQuery, project, since, until, limit: legacyLimit, offset, likePattern });
+    const rows = cachedPrepare(sql).all(...params);
+    results.push(...rows);
   } catch {
   }
   try {
-    if (query.trim()) {
-      const likePattern = `%${query}%`;
-      if (project) {
-        const consolidatedResults = cachedPrepare(
-          `SELECT id, 'consolidated' as source, content_session_id, project, NULL as tool_name,
-                  NULL as title, NULL as type, original_started_at as created_at, original_started_at_epoch as created_at_epoch
-           FROM consolidated_sessions
-           WHERE summary LIKE ? AND project = ?
-           ORDER BY original_started_at_epoch DESC LIMIT ?`
-        ).all(likePattern, project, Math.floor(limit / 4));
-        results.push(...consolidatedResults);
-      } else {
-        const consolidatedResults = cachedPrepare(
-          `SELECT id, 'consolidated' as source, content_session_id, project, NULL as tool_name,
-                  NULL as title, NULL as type, original_started_at as created_at, original_started_at_epoch as created_at_epoch
-           FROM consolidated_sessions
-           WHERE summary LIKE ?
-           ORDER BY original_started_at_epoch DESC LIMIT ?`
-        ).all(likePattern, Math.floor(limit / 4));
-        results.push(...consolidatedResults);
-      }
-    }
+    const cLimit = Math.floor(limit / 4);
+    const { sql, params } = buildConsolidatedSearchSql({ hasQuery, project, since, until, limit: cLimit, likePattern });
+    const rows = cachedPrepare(sql).all(...params);
+    results.push(...rows);
   } catch {
   }
   results.sort((a, b) => b.created_at_epoch - a.created_at_epoch);
@@ -21891,16 +21847,119 @@ function handleSearch(args) {
     const title = r.title || "";
     return `[${source}:${r.id}] ${r.created_at} | ${r.project} | ${tool} ${title}`.trim();
   });
+  const windowDesc = describeWindow(since, until);
   return {
     content: [{
       type: "text",
-      text: lines.length > 0 ? `Found ${results.length} results:
+      text: lines.length > 0 ? `Found ${results.length} results${windowDesc}:
 
 ${lines.join("\n")}
 
-Use get_observations(ids=[...]) for full details. R=raw, L=legacy, C=consolidated.` : "No results found."
+Use get_observations(ids=[...]) for full details. R=raw, L=legacy, C=consolidated.` : `No results found${windowDesc}.`
     }]
   };
+}
+function describeWindow(since, until) {
+  if (since == null && until == null) return "";
+  const fmt = (e) => new Date(e * 1e3).toISOString().slice(0, 19) + "Z";
+  if (since != null && until != null) return ` (between ${fmt(since)} and ${fmt(until)})`;
+  if (since != null) return ` (since ${fmt(since)})`;
+  return ` (until ${fmt(until)})`;
+}
+function buildRawSearchSql(opts) {
+  const useFTS = opts.mode === "fts";
+  const conditions = [];
+  const params = [];
+  const tableAlias = useFTS ? "r" : "";
+  const colPrefix = useFTS ? "r." : "";
+  if (opts.mode === "fts") {
+    conditions.push("raw_observations_fts MATCH ?");
+    params.push(opts.ftsQuery);
+  } else if (opts.mode === "like") {
+    conditions.push(`(${colPrefix}tool_name LIKE ? OR ${colPrefix}tool_input LIKE ?)`);
+    params.push(opts.likePattern, opts.likePattern);
+  }
+  if (opts.project) {
+    conditions.push(`${colPrefix}project = ?`);
+    params.push(opts.project);
+  }
+  if (opts.since != null) {
+    conditions.push(`${colPrefix}created_at_epoch >= ?`);
+    params.push(opts.since);
+  }
+  if (opts.until != null) {
+    conditions.push(`${colPrefix}created_at_epoch <= ?`);
+    params.push(opts.until);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const from = useFTS ? `FROM raw_observations r JOIN raw_observations_fts f ON r.id = f.rowid` : `FROM raw_observations`;
+  const orderBy = `ORDER BY ${colPrefix}created_at_epoch DESC LIMIT ? OFFSET ?`;
+  params.push(opts.limit, opts.offset);
+  const sql = `SELECT ${colPrefix}id, 'raw' as source, ${colPrefix}content_session_id, ${colPrefix}project, ${colPrefix}tool_name,
+                NULL as title, NULL as type, ${colPrefix}created_at, ${colPrefix}created_at_epoch
+         ${from}
+         ${where}
+         ${orderBy}`;
+  return { sql, params };
+}
+function buildLegacySearchSql(opts) {
+  const epochExpr = "(CASE WHEN created_at_epoch > 10000000000 THEN created_at_epoch / 1000 ELSE created_at_epoch END)";
+  const conditions = [];
+  const params = [];
+  if (opts.hasQuery) {
+    conditions.push("(title LIKE ? OR text LIKE ? OR narrative LIKE ?)");
+    params.push(opts.likePattern, opts.likePattern, opts.likePattern);
+  }
+  if (opts.project) {
+    conditions.push("project = ?");
+    params.push(opts.project);
+  }
+  if (opts.since != null) {
+    conditions.push(`${epochExpr} >= ?`);
+    params.push(opts.since);
+  }
+  if (opts.until != null) {
+    conditions.push(`${epochExpr} <= ?`);
+    params.push(opts.until);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  params.push(opts.limit, opts.offset);
+  const sql = `SELECT id, 'legacy' as source, COALESCE(memory_session_id, '') as content_session_id,
+                project, NULL as tool_name, title, type, created_at, ${epochExpr} as created_at_epoch
+         FROM observations
+         ${where}
+         ORDER BY ${epochExpr} DESC LIMIT ? OFFSET ?`;
+  return { sql, params };
+}
+function buildConsolidatedSearchSql(opts) {
+  const conditions = [];
+  const params = [];
+  if (opts.hasQuery) {
+    conditions.push("summary LIKE ?");
+    params.push(opts.likePattern);
+  }
+  if (opts.project) {
+    conditions.push("project = ?");
+    params.push(opts.project);
+  }
+  if (opts.since != null) {
+    conditions.push("original_started_at_epoch >= ?");
+    params.push(opts.since);
+  }
+  if (opts.until != null) {
+    conditions.push("original_started_at_epoch <= ?");
+    params.push(opts.until);
+  }
+  if (conditions.length === 0) {
+    return { sql: "SELECT * FROM consolidated_sessions WHERE 0 LIMIT 0", params: [] };
+  }
+  params.push(opts.limit);
+  const sql = `SELECT id, 'consolidated' as source, content_session_id, project, NULL as tool_name,
+                NULL as title, NULL as type, original_started_at as created_at, original_started_at_epoch as created_at_epoch
+         FROM consolidated_sessions
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY original_started_at_epoch DESC LIMIT ?`;
+  return { sql, params };
 }
 function handleTimeline(args) {
   const anchor = Number(args.anchor) || 0;
@@ -22170,15 +22229,23 @@ Prefix R: = raw observations, L: = legacy observations, C: = consolidated sessio
   },
   {
     name: "search",
-    description: "Step 1: Search memory. Returns index with IDs. Params: query, limit, project, offset, cross_project",
+    description: "Step 1: Search memory. Returns index with IDs. Params: query, limit, project, offset, cross_project, since, until.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Search query (FTS5 for raw observations, LIKE for legacy)" },
+        query: { type: "string", description: "Search query (FTS5 for raw observations, LIKE for legacy). Optional \u2014 omit to search by date alone." },
         limit: { type: "number", description: "Max results (default 20, max 100)" },
         project: { type: "string", description: "Filter by project name" },
         offset: { type: "number", description: "Pagination offset" },
-        cross_project: { type: "boolean", description: "Search across all projects (ignores project filter)" }
+        cross_project: { type: "boolean", description: "Search across all projects (ignores project filter)" },
+        since: {
+          description: 'Only return results from this point in time onward. Accepts: relative ("3 days ago", "2h ago", "yesterday"), ISO date ("2026-04-25"), epoch seconds.',
+          oneOf: [{ type: "string" }, { type: "number" }]
+        },
+        until: {
+          description: "Only return results up to this point in time. Same formats as `since`. Use both `since` and `until` to define a window.",
+          oneOf: [{ type: "string" }, { type: "number" }]
+        }
       },
       additionalProperties: true
     },

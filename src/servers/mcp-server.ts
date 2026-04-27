@@ -25,6 +25,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { openDatabase } from '../services/sqlite/DirectDB.js';
+import { parseDateExpression } from '../utils/date-parse.js';
 
 import type { Database, Statement } from 'bun:sqlite';
 
@@ -99,8 +100,9 @@ interface LegacyObsRow {
 }
 
 /**
- * Search across both raw_observations (FTS5) and legacy observations tables.
- * Uses 4 fixed SQL variants (with/without project, with/without query) for statement caching.
+ * Search across raw_observations (FTS5), legacy observations, and consolidated_sessions.
+ * Builds SQL dynamically based on which filters are present (project, since, until, query).
+ * The full SQL string is the cache key, so identical query shapes still hit the prepared statement cache.
  */
 function handleSearch(args: Record<string, any>): { content: Array<{ type: 'text'; text: string }> } {
   const query = args.query as string || '';
@@ -108,155 +110,64 @@ function handleSearch(args: Record<string, any>): { content: Array<{ type: 'text
   const project = args.cross_project ? undefined : (args.project as string | undefined);
   const offset = Number(args.offset) || 0;
 
+  // Date filters (since / until)
+  const since = args.since != null ? parseDateExpression(args.since) : null;
+  const until = args.until != null ? parseDateExpression(args.until) : null;
+
+  if (args.since != null && since == null) {
+    return { content: [{ type: 'text' as const, text: `Could not parse 'since': "${args.since}". Try formats like "3 days ago", "yesterday", "2026-04-25", or epoch seconds.` }] };
+  }
+  if (args.until != null && until == null) {
+    return { content: [{ type: 'text' as const, text: `Could not parse 'until': "${args.until}". Try formats like "3 days ago", "yesterday", "2026-04-25", or epoch seconds.` }] };
+  }
+
   const results: SearchRow[] = [];
+  const hasQuery = !!query.trim();
+  const ftsQuery = hasQuery ? query.split(/\s+/).map(term => `"${term.replace(/"/g, '')}"`).join(' ') : '';
+  const likePattern = hasQuery ? `%${query}%` : '';
 
-  // Search raw_observations via FTS5
-  if (query.trim()) {
-    const ftsQuery = query.split(/\s+/).map(term => `"${term.replace(/"/g, '')}"`).join(' ');
+  // ─── raw_observations ───
+  // Try FTS5 first, fall back to LIKE on syntax error
+  let rawAdded = false;
+  if (hasQuery) {
     try {
-      if (project) {
-        const rawResults = cachedPrepare(
-          `SELECT r.id, 'raw' as source, r.content_session_id, r.project, r.tool_name,
-                  NULL as title, NULL as type, r.created_at, r.created_at_epoch
-           FROM raw_observations r
-           JOIN raw_observations_fts f ON r.id = f.rowid
-           WHERE raw_observations_fts MATCH ? AND r.project = ?
-           ORDER BY r.created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(ftsQuery, project, limit, offset) as SearchRow[];
-        results.push(...rawResults);
-      } else {
-        const rawResults = cachedPrepare(
-          `SELECT r.id, 'raw' as source, r.content_session_id, r.project, r.tool_name,
-                  NULL as title, NULL as type, r.created_at, r.created_at_epoch
-           FROM raw_observations r
-           JOIN raw_observations_fts f ON r.id = f.rowid
-           WHERE raw_observations_fts MATCH ?
-           ORDER BY r.created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(ftsQuery, limit, offset) as SearchRow[];
-        results.push(...rawResults);
-      }
+      const { sql, params } = buildRawSearchSql({ mode: 'fts', project, since, until, limit, offset, ftsQuery });
+      const rows = cachedPrepare(sql).all(...params) as SearchRow[];
+      results.push(...rows);
+      rawAdded = true;
     } catch {
-      // FTS query syntax error - fall back to LIKE
-      const likePattern = `%${query}%`;
-      if (project) {
-        const rawResults = cachedPrepare(
-          `SELECT id, 'raw' as source, content_session_id, project, tool_name,
-                  NULL as title, NULL as type, created_at, created_at_epoch
-           FROM raw_observations
-           WHERE (tool_name LIKE ? OR tool_input LIKE ?) AND project = ?
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(likePattern, likePattern, project, limit, offset) as SearchRow[];
-        results.push(...rawResults);
-      } else {
-        const rawResults = cachedPrepare(
-          `SELECT id, 'raw' as source, content_session_id, project, tool_name,
-                  NULL as title, NULL as type, created_at, created_at_epoch
-           FROM raw_observations
-           WHERE (tool_name LIKE ? OR tool_input LIKE ?)
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(likePattern, likePattern, limit, offset) as SearchRow[];
-        results.push(...rawResults);
-      }
-    }
-  } else {
-    // No query: return recent raw observations
-    if (project) {
-      const rawResults = cachedPrepare(
-        `SELECT id, 'raw' as source, content_session_id, project, tool_name,
-                NULL as title, NULL as type, created_at, created_at_epoch
-         FROM raw_observations WHERE project = ?
-         ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-      ).all(project, limit, offset) as SearchRow[];
-      results.push(...rawResults);
-    } else {
-      const rawResults = cachedPrepare(
-        `SELECT id, 'raw' as source, content_session_id, project, tool_name,
-                NULL as title, NULL as type, created_at, created_at_epoch
-         FROM raw_observations
-         ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-      ).all(limit, offset) as SearchRow[];
-      results.push(...rawResults);
+      // FTS syntax error — fall through to LIKE
     }
   }
+  if (!rawAdded) {
+    const mode = hasQuery ? 'like' : 'none';
+    const { sql, params } = buildRawSearchSql({ mode, project, since, until, limit, offset, likePattern });
+    const rows = cachedPrepare(sql).all(...params) as SearchRow[];
+    results.push(...rows);
+  }
 
-  // Also search legacy observations table
+  // ─── legacy observations ───
   try {
-    if (query.trim()) {
-      const likePattern = `%${query}%`;
-      if (project) {
-        const legacyResults = cachedPrepare(
-          `SELECT id, 'legacy' as source, COALESCE(memory_session_id, '') as content_session_id,
-                  project, NULL as tool_name, title, type, created_at, created_at_epoch
-           FROM observations
-           WHERE (title LIKE ? OR text LIKE ? OR narrative LIKE ?) AND project = ?
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(likePattern, likePattern, likePattern, project, Math.floor(limit / 2), offset) as SearchRow[];
-        results.push(...legacyResults);
-      } else {
-        const legacyResults = cachedPrepare(
-          `SELECT id, 'legacy' as source, COALESCE(memory_session_id, '') as content_session_id,
-                  project, NULL as tool_name, title, type, created_at, created_at_epoch
-           FROM observations
-           WHERE (title LIKE ? OR text LIKE ? OR narrative LIKE ?)
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(likePattern, likePattern, likePattern, Math.floor(limit / 2), offset) as SearchRow[];
-        results.push(...legacyResults);
-      }
-    } else {
-      if (project) {
-        const legacyResults = cachedPrepare(
-          `SELECT id, 'legacy' as source, COALESCE(memory_session_id, '') as content_session_id,
-                  project, NULL as tool_name, title, type, created_at, created_at_epoch
-           FROM observations WHERE project = ?
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(project, Math.floor(limit / 2), offset) as SearchRow[];
-        results.push(...legacyResults);
-      } else {
-        const legacyResults = cachedPrepare(
-          `SELECT id, 'legacy' as source, COALESCE(memory_session_id, '') as content_session_id,
-                  project, NULL as tool_name, title, type, created_at, created_at_epoch
-           FROM observations
-           ORDER BY created_at_epoch DESC LIMIT ? OFFSET ?`
-        ).all(Math.floor(limit / 2), offset) as SearchRow[];
-        results.push(...legacyResults);
-      }
-    }
+    const legacyLimit = Math.floor(limit / 2);
+    const { sql, params } = buildLegacySearchSql({ hasQuery, project, since, until, limit: legacyLimit, offset, likePattern });
+    const rows = cachedPrepare(sql).all(...params) as SearchRow[];
+    results.push(...rows);
   } catch {
-    // Legacy table may not exist or have different schema
+    // Legacy table may not exist
   }
 
-  // Also search consolidated_sessions
+  // ─── consolidated_sessions ───
   try {
-    if (query.trim()) {
-      const likePattern = `%${query}%`;
-      if (project) {
-        const consolidatedResults = cachedPrepare(
-          `SELECT id, 'consolidated' as source, content_session_id, project, NULL as tool_name,
-                  NULL as title, NULL as type, original_started_at as created_at, original_started_at_epoch as created_at_epoch
-           FROM consolidated_sessions
-           WHERE summary LIKE ? AND project = ?
-           ORDER BY original_started_at_epoch DESC LIMIT ?`
-        ).all(likePattern, project, Math.floor(limit / 4)) as SearchRow[];
-        results.push(...consolidatedResults);
-      } else {
-        const consolidatedResults = cachedPrepare(
-          `SELECT id, 'consolidated' as source, content_session_id, project, NULL as tool_name,
-                  NULL as title, NULL as type, original_started_at as created_at, original_started_at_epoch as created_at_epoch
-           FROM consolidated_sessions
-           WHERE summary LIKE ?
-           ORDER BY original_started_at_epoch DESC LIMIT ?`
-        ).all(likePattern, Math.floor(limit / 4)) as SearchRow[];
-        results.push(...consolidatedResults);
-      }
-    }
+    const cLimit = Math.floor(limit / 4);
+    const { sql, params } = buildConsolidatedSearchSql({ hasQuery, project, since, until, limit: cLimit, likePattern });
+    const rows = cachedPrepare(sql).all(...params) as SearchRow[];
+    results.push(...rows);
   } catch {
     // consolidated_sessions table may not exist yet
   }
 
-  // Sort combined results by time
+  // Sort combined results by time, format compact index
   results.sort((a, b) => b.created_at_epoch - a.created_at_epoch);
-
-  // Format as compact index
   const lines = results.slice(0, limit).map(r => {
     const source = r.source === 'raw' ? 'R' : r.source === 'consolidated' ? 'C' : 'L';
     const tool = r.tool_name || r.type || '';
@@ -264,14 +175,173 @@ function handleSearch(args: Record<string, any>): { content: Array<{ type: 'text
     return `[${source}:${r.id}] ${r.created_at} | ${r.project} | ${tool} ${title}`.trim();
   });
 
+  // Build window descriptor for the result message
+  const windowDesc = describeWindow(since, until);
+
   return {
     content: [{
       type: 'text' as const,
       text: lines.length > 0
-        ? `Found ${results.length} results:\n\n${lines.join('\n')}\n\nUse get_observations(ids=[...]) for full details. R=raw, L=legacy, C=consolidated.`
-        : 'No results found.'
+        ? `Found ${results.length} results${windowDesc}:\n\n${lines.join('\n')}\n\nUse get_observations(ids=[...]) for full details. R=raw, L=legacy, C=consolidated.`
+        : `No results found${windowDesc}.`
     }]
   };
+}
+
+function describeWindow(since: number | null, until: number | null): string {
+  if (since == null && until == null) return '';
+  const fmt = (e: number) => new Date(e * 1000).toISOString().slice(0, 19) + 'Z';
+  if (since != null && until != null) return ` (between ${fmt(since)} and ${fmt(until)})`;
+  if (since != null) return ` (since ${fmt(since)})`;
+  return ` (until ${fmt(until!)})`;
+}
+
+interface RawSearchOpts {
+  mode: 'fts' | 'like' | 'none';
+  project?: string;
+  since?: number | null;
+  until?: number | null;
+  limit: number;
+  offset: number;
+  ftsQuery?: string;
+  likePattern?: string;
+}
+
+function buildRawSearchSql(opts: RawSearchOpts): { sql: string; params: any[] } {
+  const useFTS = opts.mode === 'fts';
+  const conditions: string[] = [];
+  const params: any[] = [];
+  const tableAlias = useFTS ? 'r' : '';
+  const colPrefix = useFTS ? 'r.' : '';
+
+  if (opts.mode === 'fts') {
+    conditions.push('raw_observations_fts MATCH ?');
+    params.push(opts.ftsQuery!);
+  } else if (opts.mode === 'like') {
+    conditions.push(`(${colPrefix}tool_name LIKE ? OR ${colPrefix}tool_input LIKE ?)`);
+    params.push(opts.likePattern!, opts.likePattern!);
+  }
+
+  if (opts.project) {
+    conditions.push(`${colPrefix}project = ?`);
+    params.push(opts.project);
+  }
+  if (opts.since != null) {
+    conditions.push(`${colPrefix}created_at_epoch >= ?`);
+    params.push(opts.since);
+  }
+  if (opts.until != null) {
+    conditions.push(`${colPrefix}created_at_epoch <= ?`);
+    params.push(opts.until);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const from = useFTS
+    ? `FROM raw_observations r JOIN raw_observations_fts f ON r.id = f.rowid`
+    : `FROM raw_observations`;
+  const orderBy = `ORDER BY ${colPrefix}created_at_epoch DESC LIMIT ? OFFSET ?`;
+  params.push(opts.limit, opts.offset);
+
+  const sql = `SELECT ${colPrefix}id, 'raw' as source, ${colPrefix}content_session_id, ${colPrefix}project, ${colPrefix}tool_name,
+                NULL as title, NULL as type, ${colPrefix}created_at, ${colPrefix}created_at_epoch
+         ${from}
+         ${where}
+         ${orderBy}`;
+  return { sql, params };
+}
+
+interface LegacySearchOpts {
+  hasQuery: boolean;
+  project?: string;
+  since?: number | null;
+  until?: number | null;
+  limit: number;
+  offset: number;
+  likePattern: string;
+}
+
+function buildLegacySearchSql(opts: LegacySearchOpts): { sql: string; params: any[] } {
+  // Legacy `observations` table stores created_at_epoch in MILLISECONDS,
+  // while raw_observations and our `since`/`until` use SECONDS.
+  // Normalize on read with CASE so values >10^10 (clearly ms) get divided by 1000.
+  const epochExpr = '(CASE WHEN created_at_epoch > 10000000000 THEN created_at_epoch / 1000 ELSE created_at_epoch END)';
+
+  const conditions: string[] = [];
+  const params: any[] = [];
+
+  if (opts.hasQuery) {
+    conditions.push('(title LIKE ? OR text LIKE ? OR narrative LIKE ?)');
+    params.push(opts.likePattern, opts.likePattern, opts.likePattern);
+  }
+  if (opts.project) {
+    conditions.push('project = ?');
+    params.push(opts.project);
+  }
+  if (opts.since != null) {
+    conditions.push(`${epochExpr} >= ?`);
+    params.push(opts.since);
+  }
+  if (opts.until != null) {
+    conditions.push(`${epochExpr} <= ?`);
+    params.push(opts.until);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  params.push(opts.limit, opts.offset);
+
+  // Return normalized created_at_epoch (seconds) so sorting matches raw_observations
+  const sql = `SELECT id, 'legacy' as source, COALESCE(memory_session_id, '') as content_session_id,
+                project, NULL as tool_name, title, type, created_at, ${epochExpr} as created_at_epoch
+         FROM observations
+         ${where}
+         ORDER BY ${epochExpr} DESC LIMIT ? OFFSET ?`;
+  return { sql, params };
+}
+
+interface ConsolidatedSearchOpts {
+  hasQuery: boolean;
+  project?: string;
+  since?: number | null;
+  until?: number | null;
+  limit: number;
+  likePattern: string;
+}
+
+function buildConsolidatedSearchSql(opts: ConsolidatedSearchOpts): { sql: string; params: any[] } {
+  const conditions: string[] = [];
+  const params: any[] = [];
+
+  if (opts.hasQuery) {
+    conditions.push('summary LIKE ?');
+    params.push(opts.likePattern);
+  }
+  if (opts.project) {
+    conditions.push('project = ?');
+    params.push(opts.project);
+  }
+  if (opts.since != null) {
+    conditions.push('original_started_at_epoch >= ?');
+    params.push(opts.since);
+  }
+  if (opts.until != null) {
+    conditions.push('original_started_at_epoch <= ?');
+    params.push(opts.until);
+  }
+
+  // Skip the consolidated query entirely if there are no useful filters AND no query
+  // (returning all consolidated rows isn't useful and is potentially expensive)
+  if (conditions.length === 0) {
+    return { sql: 'SELECT * FROM consolidated_sessions WHERE 0 LIMIT 0', params: [] };
+  }
+
+  params.push(opts.limit);
+
+  const sql = `SELECT id, 'consolidated' as source, content_session_id, project, NULL as tool_name,
+                NULL as title, NULL as type, original_started_at as created_at, original_started_at_epoch as created_at_epoch
+         FROM consolidated_sessions
+         WHERE ${conditions.join(' AND ')}
+         ORDER BY original_started_at_epoch DESC LIMIT ?`;
+  return { sql, params };
 }
 
 /**
@@ -600,15 +670,23 @@ Prefix R: = raw observations, L: = legacy observations, C: = consolidated sessio
   },
   {
     name: 'search',
-    description: 'Step 1: Search memory. Returns index with IDs. Params: query, limit, project, offset, cross_project',
+    description: 'Step 1: Search memory. Returns index with IDs. Params: query, limit, project, offset, cross_project, since, until.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search query (FTS5 for raw observations, LIKE for legacy)' },
+        query: { type: 'string', description: 'Search query (FTS5 for raw observations, LIKE for legacy). Optional — omit to search by date alone.' },
         limit: { type: 'number', description: 'Max results (default 20, max 100)' },
         project: { type: 'string', description: 'Filter by project name' },
         offset: { type: 'number', description: 'Pagination offset' },
-        cross_project: { type: 'boolean', description: 'Search across all projects (ignores project filter)' }
+        cross_project: { type: 'boolean', description: 'Search across all projects (ignores project filter)' },
+        since: {
+          description: 'Only return results from this point in time onward. Accepts: relative ("3 days ago", "2h ago", "yesterday"), ISO date ("2026-04-25"), epoch seconds.',
+          oneOf: [{ type: 'string' }, { type: 'number' }]
+        },
+        until: {
+          description: 'Only return results up to this point in time. Same formats as `since`. Use both `since` and `until` to define a window.',
+          oneOf: [{ type: 'string' }, { type: 'number' }]
+        }
       },
       additionalProperties: true
     },

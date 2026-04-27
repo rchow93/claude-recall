@@ -12,6 +12,7 @@ All data stays local in a single SQLite database. No background daemons, no netw
 |---------|:---:|:---:|:---:|
 | **One-command install** (`/plugin install claude-recall`) | **Yes** | Yes | Varies |
 | **Full-fidelity session recovery** (24h window, up to 1M tokens) | **Yes** | No (lossy AI summary only) | No |
+| **Date-aware search** (`since="3 days ago"`, ISO ranges) | **Yes** | No | No |
 | **Zero API token cost** (no AI compression calls) | **Yes** | No (uses Claude Agent SDK) | Varies |
 | Zero background daemons | Yes | No (Express server) | Varies |
 | No Python/Chroma required | Yes | No | Varies |
@@ -269,9 +270,12 @@ sqlite3 ~/.claude-recall/claude-recall.db "SELECT COUNT(*) FROM raw_observations
 
 Once installed, you can ask Claude things like:
 
-- *"Search my memory for the auth bug fix"* — Claude calls `mcp__claude-recall__search`
-- *"What did I work on yesterday in the workweek repo?"* — `search` with project filter
-- *"Search across all repos for stripe webhook"* — `search` with `cross_project=true`
+- *"Search my memory for the auth bug fix"* — keyword search
+- *"What did I work on yesterday in the workweek repo?"* — `search(since="yesterday")` with project filter
+- *"Find the node.js code we wrote 3 days ago"* — `search(query="node.js", since="3 days ago")`
+- *"Show me everything from the last 2 hours"* — `search(since="2h ago")`
+- *"Recall the auth changes from between April 20 and April 22"* — date window
+- *"Search across all repos for stripe webhook"* — `cross_project=true`
 - *"Forget any observations mentioning my-old-api-key"* — `forget` tool
 - *"Show me the timeline around when I last touched login.ts"* — `timeline` tool
 
@@ -541,11 +545,24 @@ The MCP server provides five tools following a 3-layer workflow for token-effici
 ```
 search(query="authentication bug", project="my-app", limit=20)
 search(query="database migration", cross_project=true)
+
+# Date-aware queries (no keyword needed)
+search(since="yesterday")
+search(since="2 days ago", until="1 day ago")          # window
+search(since="30 minutes ago")
+search(query="node.js", since="3 days ago")             # keyword + date window
+search(since="2026-04-25T00:00:00Z", until="2026-04-26T00:00:00Z")  # ISO
 ```
+
+**`since` / `until` accept:**
+- Relative: `"3 days ago"`, `"2h ago"`, `"30 minutes ago"`, `"yesterday"`, `"last week"`
+- Keywords: `"now"`, `"today"`, `"yesterday"`, `"tomorrow"`
+- ISO 8601: `"2026-04-25"`, `"2026-04-25T14:30:00Z"`
+- Epoch seconds (number)
 
 Returns a compact index with IDs:
 ```
-Found 23 results:
+Found 23 results (since 2026-04-26T00:00:00Z):
 
 [R:142] 2026-03-27T14:30:00Z | my-app | Edit src/auth/jwt.ts
 [R:140] 2026-03-27T14:25:30Z | my-app | Bash npm test
