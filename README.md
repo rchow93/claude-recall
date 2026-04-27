@@ -195,6 +195,41 @@ Full detail is always available on-demand via MCP tools.
 
 **Why two modes?** Human memory works the same way: "what was I just doing?" needs total recall; "what did I work on last month?" only needs the gist. claude-recall mirrors that distinction automatically.
 
+#### How This Compares to `claude --continue` / `claude --resume`
+
+Claude Code already ships with native session restoration:
+
+```bash
+claude --continue                      # resume your last conversation in this directory
+claude --resume                        # interactive picker of past sessions
+claude --resume "session-name"         # resume a specifically named session
+```
+
+These are excellent for **single-session continuity** — same conversation, full history, picks up exactly where you left off.
+
+**Where Recovery Mode adds value beyond `--continue` / `--resume`:**
+
+| Scenario | `--continue` / `--resume` | claude-recall |
+|----------|:---:|:---:|
+| Crashed mid-session, want exact thread back | ✅ Perfect | Redundant |
+| **Multi-session feature work** (e.g. 3 sessions over 2 days) | ❌ Resumes ONE session | ✅ Aggregates all sessions in window |
+| **Fresh conversation, but with awareness** of recent work | ❌ All-or-nothing — forces you back into old thread | ✅ Structured context, clean chat |
+| **Auto-compaction loss** (Claude Code compresses long sessions) | ❌ Pre-compaction detail is gone forever | ✅ Raw observations preserved separately |
+| Don't remember which session had the work | ❌ Have to scroll/pick | ✅ Auto-injected on any new session |
+| Search past activity programmatically | ❌ Not available | ✅ MCP `search`, `timeline`, `get_observations` |
+| Selectively forget something | ❌ All-or-nothing | ✅ `forget()` MCP tool |
+| Auto-redact API keys/tokens before storage | ❌ Stores everything verbatim | ✅ Built-in redaction |
+| Privacy suppression (`<private>` tags) | ❌ Not available | ✅ Built-in |
+
+**Different problems, different tools:**
+
+- **`--continue`** answers *"where was I in **this conversation**?"*
+- **claude-recall Recovery Mode** answers *"where am I in **this project**?"*
+
+The killer use case isn't "I crashed." It's **"I want a clean conversation today that knows what I did yesterday."** `--continue` forces you back into the old thread; Recovery Mode lets you start fresh with awareness — useful when context bloat or off-track conversations make you want to start over without losing the work.
+
+For multi-session features (which is most real work), Recovery Mode aggregates 3-5 recent sessions into one orienting context block — something `--resume` simply can't do because it operates on one session at a time.
+
 ## Installation
 
 ### Prerequisites
