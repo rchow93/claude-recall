@@ -1478,6 +1478,10 @@ function getConsolidatedContext(db, projects, currentLength) {
   }
   return lines.join("\n");
 }
+var RECALL_USAGE_FOOTER = `
+---
+## Using claude-recall MCP tools
+**3-layer workflow:** (1) \`search(query)\` \u2192 compact index with IDs, (2) \`timeline(anchor=ID)\` \u2192 context around a result, (3) \`get_observations(ids=[...])\` \u2192 full details. Search returns IDs, not content \u2014 always drill down with get_observations. ID prefixes: R: = raw, L: = legacy, C: = consolidated. Supports \`since\`/\`until\` date filters and \`cross_project=true\`.`;
 var contextHandler = {
   async execute(input) {
     const cwd = input.cwd ?? process.cwd();
@@ -1495,7 +1499,7 @@ var contextHandler = {
         return {
           hookSpecificOutput: {
             hookEventName: "SessionStart",
-            additionalContext: recoveryContext
+            additionalContext: recoveryContext + RECALL_USAGE_FOOTER
           }
         };
       }
@@ -1523,6 +1527,9 @@ var contextHandler = {
         if (consolidated) {
           additionalContext += "\n\n" + consolidated;
         }
+      }
+      if (additionalContext) {
+        additionalContext += RECALL_USAGE_FOOTER;
       }
       logger.debug("HOOK", "Summary mode (no recent activity)", {
         sessions: sessions.length,
