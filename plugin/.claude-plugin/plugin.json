@@ -20,6 +20,5 @@
     "sqlite",
     "hooks"
   ],
-  "hooks": "./hooks/hooks.json",
   "mcpServers": "./.mcp.json"
 }

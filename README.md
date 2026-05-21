@@ -249,9 +249,23 @@ For multi-session features (which is most real work), Recovery Mode aggregates 3
 
 ### Quickstart (Plugin Marketplace)
 
+Run these two commands in your terminal (not inside a Claude Code session):
+
+```bash
+claude plugin marketplace add askqai/claude-recall
+claude plugin install claude-recall@claude-recall
+```
+
+Or from inside a Claude Code session:
+
 ```text
 /plugin marketplace add askqai/claude-recall
-/plugin install claude-recall
+```
+
+Then install via the CLI:
+
+```bash
+claude plugin install claude-recall@claude-recall
 ```
 
 That's it. Restart Claude Code and Recovery Mode will start working automatically. The plugin includes hooks (data capture) and the MCP server (search/forget tools) — both registered in one step.
