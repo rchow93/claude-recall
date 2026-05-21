@@ -41,3 +41,6 @@ logs/
 
 # Claude Code local settings
 .claude/
+
+# Internal docs (marketing drafts, not part of the distributed plugin)
+docs/

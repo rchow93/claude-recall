@@ -14,8 +14,8 @@ All data stays local in a single SQLite database. No background daemons, no netw
 | **Full-fidelity session recovery** (24h window, up to 1M tokens) | **Yes** | No (lossy AI summary only) | No |
 | **Date-aware search** (`since="3 days ago"`, ISO ranges) | **Yes** | No | No |
 | **Zero API token cost** (no AI compression calls) | **Yes** | No (uses Claude Agent SDK) | Varies |
-| Zero background daemons | Yes | No (Express server) | Varies |
-| No Python/Chroma required | Yes | No | Varies |
+| Zero background daemons | Yes | No (HTTP worker on port 37777) | Varies |
+| No Python/ChromaDB required | Yes | No (ChromaDB uses 35GB+ RAM) | Varies |
 | Direct SQLite (WAL mode) | Yes | HTTP proxy | Varies |
 | Smart relevance scoring | Yes | No | No |
 | Auto-redaction of secrets | Yes | No | No |
@@ -24,7 +24,20 @@ All data stays local in a single SQLite database. No background daemons, no netw
 | Cross-project search | Yes | No | No |
 | Token-efficient 3-layer search | Yes | Yes | No |
 | Single dependency (MCP SDK) | Yes | No (15+ deps) | Varies |
-| **License** | **Apache 2.0** | AGPL-3.0 | Varies |
+| **License** | **Apache 2.0** | Apache 2.0 (partial PolyForm NC) | Varies |
+
+## Why claude-recall over claude-mem?
+
+If you've tried [claude-mem](https://github.com/thedotmack/claude-mem), you've likely hit one of these:
+
+| Pain point | claude-mem | claude-recall |
+|-----------|------------|---------------|
+| **Token burn** | AI compression fires on every tool call via Claude Agent SDK. Users report burning through Pro plan 5-hour limits in single sessions. | Zero API calls. Raw storage with deterministic compression. Your token budget goes to actual work. |
+| **RAM explosion** | ChromaDB process consumes 35GB+ RAM on macOS. Orphaned child processes accumulate memory until reboot. | Single SQLite file. ~50MB typical database. No background processes. |
+| **Background daemon** | HTTP worker on port 37777 required. Port conflicts, SQLite lock errors, and stalled observations when the worker crashes. | Direct SQLite writes via `bun:sqlite`. No daemon, no ports, no locks. |
+| **Secret exposure** | Only manual `<private>` tags. Raw tool outputs (including API keys, tokens, passwords) stored and sent to Anthropic's API for compression. | Automatic redaction of 8 secret patterns (API keys, bearer tokens, AWS keys, private keys, GitHub/OpenAI/Slack tokens, passwords) before storage. Nothing leaves your machine. |
+| **Session recovery** | Lossy AI summaries. Context is compressed — you can't get back what was lost. | Full-fidelity recovery. Verbatim prompts, complete assistant responses, every tool call with inputs and outputs. Up to 1M token budget. |
+| **Dependencies** | Bun + Python + uv + ChromaDB + ONNX runtime + Express server (15+ dependencies) | Bun + MCP SDK (1 dependency) |
 
 ## Architecture
 
@@ -277,16 +290,55 @@ sqlite3 ~/.claude-recall/claude-recall.db "SELECT COUNT(*) FROM raw_observations
 
 ### Inside a Claude Code Session
 
-Once installed, you can ask Claude things like:
+Once installed, just ask Claude in natural language. Here are 10 real-world scenarios:
 
-- *"Search my memory for the auth bug fix"* — keyword search
-- *"What did I work on yesterday in the workweek repo?"* — `search(since="yesterday")` with project filter
-- *"Find the node.js code we wrote 3 days ago"* — `search(query="node.js", since="3 days ago")`
-- *"Show me everything from the last 2 hours"* — `search(since="2h ago")`
-- *"Recall the auth changes from between April 20 and April 22"* — date window
-- *"Search across all repos for stripe webhook"* — `cross_project=true`
-- *"Forget any observations mentioning my-old-api-key"* — `forget` tool
-- *"Show me the timeline around when I last touched login.ts"* — `timeline` tool
+#### 1. Pick up where you left off (automatic)
+Start a new session and Recovery Mode injects your last 24 hours of work automatically — full prompts, Claude's responses, every file touched. No command needed.
+
+#### 2. Search by date
+> *"What did we deploy to production last Thursday?"*
+
+Uses `since`/`until` date filtering. Accepts natural language ("3 days ago", "yesterday"), ISO dates ("2026-05-19"), or epoch timestamps.
+
+#### 3. Cross-repo search
+> *"Search across all my repos for WebSocket authentication changes"*
+
+Finds results across every project you've worked on — not just the current directory. Uses `cross_project=true`.
+
+#### 4. Debug a regression
+> *"Search my recall for changes to the payment webhook handler in the last 2 weeks"*
+
+Narrow down when a breaking change was introduced by searching tool activity within a time window.
+
+#### 5. Resume a multi-day feature
+> *"What was the state of the LiveKit copilot integration when I last worked on it?"*
+
+Recovery Mode aggregates 3-5 recent sessions into one context block. Unlike `--continue`, you get a clean conversation that knows what you did — without the context bloat.
+
+#### 6. Find code you wrote but can't remember where
+> *"Search across all projects for the rate limiter middleware we built"*
+
+Full-text search across every stored prompt and tool use, with drill-down to see the exact file contents.
+
+#### 7. Recall a decision and its context
+> *"Show me the timeline around when we switched from Deepgram to Groq for STT"*
+
+The `timeline` tool shows what happened before, during, and after a change — giving you the reasoning, not just the diff.
+
+#### 8. Audit what happened in a specific session
+> *"Show me everything from May 19 between 10pm and midnight"*
+
+Date-range search with `since="2026-05-19T22:00:00Z"` and `until="2026-05-20T00:00:00Z"` for precise session reconstruction.
+
+#### 9. Clean up sensitive data
+> *"Forget any observations that mention the old Stripe test key"*
+
+The `forget` tool does a dry run first (shows what would be deleted), then confirms deletion. Auto-redaction catches most secrets before they're stored, but this handles anything that slipped through.
+
+#### 10. Onboard to an unfamiliar repo
+> *"Search recall for work my team did on the billing service last month"*
+
+Search across projects and time ranges to understand what was built, what decisions were made, and what's still in progress — even if you weren't the one who did the work.
 
 The MCP tools are visible to Claude as `mcp__claude-recall__*`.
 
