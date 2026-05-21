@@ -7,7 +7,12 @@
   "plugins": [
     {
       "name": "claude-recall",
-      "source": "./",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/askqai/claude-recall",
+        "path": ".",
+        "ref": "main"
+      },
       "description": "Lightweight persistent memory for Claude Code with full-fidelity Recovery Mode",
       "version": "11.4.0"
     }
