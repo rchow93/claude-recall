@@ -1,4 +1,5 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "claude-recall",
   "owner": {
     "name": "Richard Chow",
@@ -8,10 +9,8 @@
     {
       "name": "claude-recall",
       "source": {
-        "source": "git-subdir",
-        "url": "https://github.com/askqai/claude-recall",
-        "path": ".",
-        "ref": "main"
+        "source": "github",
+        "repo": "askqai/claude-recall"
       },
       "description": "Lightweight persistent memory for Claude Code with full-fidelity Recovery Mode",
       "version": "11.4.0"
