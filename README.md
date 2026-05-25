@@ -926,6 +926,16 @@ sqlite3 ~/.claude-recall/claude-recall.db \
   "SELECT COUNT(*) as redacted_count FROM raw_observations WHERE redacted = 1;"
 ```
 
+## Future Enhancements
+
+Contributions welcome — these are good first issues for open-source contributors:
+
+- **Config file** (`~/.claude-recall/config.json`) — Replace env vars with a persistent config file that hooks read on every call. No restart needed to change settings. Could include an MCP `configure` tool so users say "set max DB size to 5GB" in natural language.
+- **Web dashboard** — Lightweight local UI for browsing sessions, searching observations, and viewing timelines visually. Read-only against the SQLite database.
+- **Semantic search** — Optional vector similarity search for fuzzy queries ("find where I was debugging that auth issue"). Would complement the existing FTS5 keyword search, not replace it.
+- **Export/import** — Backup and restore observations across machines or share project history with teammates.
+- **Per-project settings** — Override global defaults (redaction, DB size, relevance thresholds) at the project level.
+
 ## Privacy
 
 All data is stored locally on disk at `~/.claude-recall/`. Nothing is sent to external services. The MCP server communicates only via stdio (no network).
