@@ -1919,8 +1919,8 @@ function smartCleanup(db, deleteCount) {
 }
 
 // src/cli/handlers/observation.ts
-var MAX_RESPONSE_BYTES = 1e4;
-var MAX_INPUT_BYTES = 1e4;
+var MAX_RESPONSE_BYTES = 5e4;
+var MAX_INPUT_BYTES = 5e4;
 var MAX_DB_PAGES = 2621440;
 var CLEANUP_PROBABILITY = 0.01;
 var CLEANUP_BATCH_PERCENT = 0.1;

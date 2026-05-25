@@ -2,7 +2,7 @@
  * Observation Handler - PostToolUse
  *
  * Stores raw tool data directly to SQLite. No worker daemon, no subprocess.
- * Caps tool_response at 10KB to prevent DB bloat.
+ * Caps tool_response at 50KB to prevent DB bloat.
  * Periodically captures assistant responses from the transcript (~every 10 min).
  * Runs periodic cleanup of old observations when DB exceeds 10GB.
  */
@@ -16,10 +16,10 @@ import { computeRelevanceScore } from './relevance.js';
 import { redactSensitiveContent, containsSensitivePatterns } from '../../utils/privacy.js';
 import { consolidateOldSessions, applyTimeDecay, smartCleanup } from '../../services/consolidation.js';
 
-/** Max size for tool_response storage (10KB). Larger responses are truncated. */
-const MAX_RESPONSE_BYTES = 10_000;
-/** Max size for tool_input storage (10KB). */
-const MAX_INPUT_BYTES = 10_000;
+/** Max size for tool_response storage (50KB). Larger responses are truncated. */
+const MAX_RESPONSE_BYTES = 50_000;
+/** Max size for tool_input storage (50KB). */
+const MAX_INPUT_BYTES = 50_000;
 /** Max database page count before cleanup triggers. 10GB / 4096 = 2,621,440 pages */
 const MAX_DB_PAGES = 2_621_440;
 /** Only check DB size ~1% of the time to avoid overhead */

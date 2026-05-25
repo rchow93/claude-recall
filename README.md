@@ -666,7 +666,7 @@ Returns complete records with tool input, response, cwd, etc. Accepts prefixed I
 - `L:` — legacy observations
 - `C:` — consolidated sessions
 
-Optional `max_length` parameter controls per-field truncation (default 2000, max 50000). Use higher values to retrieve full file contents from large Write or Read operations.
+Optional `max_length` parameter controls per-field truncation (default 2000, max 50000). Use higher values to retrieve full file contents from large Write or Read operations. Storage captures up to 50KB per field, so `max_length=50000` retrieves everything stored.
 
 ### `forget` — Delete observations
 
@@ -702,8 +702,8 @@ CREATE TABLE raw_observations (
   content_session_id TEXT NOT NULL,
   project TEXT NOT NULL,
   tool_name TEXT NOT NULL,
-  tool_input TEXT,              -- JSON, capped at 10KB
-  tool_response TEXT,           -- capped at 10KB
+  tool_input TEXT,              -- JSON, capped at 50KB
+  tool_response TEXT,           -- capped at 50KB
   cwd TEXT,
   prompt_number INTEGER,
   created_at TEXT NOT NULL,
@@ -774,7 +774,7 @@ Both `raw_observations` and `user_prompts` have FTS5 virtual tables with automat
 - **Decay:** Observations >90 days have relevance scores halved (floor at 0.05)
 - **Cleanup strategy:** When DB exceeds 10GB, deletes by lowest `relevance_score` first, then oldest
 - **Cleanup frequency:** All three layers run probabilistically on ~1% of PostToolUse invocations
-- **Input/response cap:** 10 KB per field (larger payloads truncated with `...[truncated]` marker)
+- **Input/response cap:** 50 KB per field (larger payloads truncated with `...[truncated]` marker)
 
 ### SQLite Configuration
 
