@@ -1194,6 +1194,7 @@ function getProjectContext(cwd) {
 
 // src/cli/handlers/context.ts
 var MAX_SUMMARY_CHARS = 8e3;
+var RECOVERY_MODE = (process.env.CLAUDE_RECALL_RECOVERY_MODE ?? "full").toLowerCase();
 var RECOVERY_WINDOW_HOURS = Number(process.env.CLAUDE_RECALL_RECOVERY_WINDOW_HOURS) || 24;
 var RECOVERY_BUDGET_TOKENS = Number(process.env.CLAUDE_RECALL_RECOVERY_BUDGET_TOKENS) || 2e5;
 var CHARS_PER_TOKEN = 4;
@@ -1547,19 +1548,30 @@ var contextHandler = {
     const db = openDatabase();
     try {
       const projects = context.allProjects;
-      const recoveryContext = buildRecoveryContext(db, projects);
-      if (recoveryContext) {
-        logger.debug("HOOK", "Recovery mode active", {
-          contextLength: recoveryContext.length,
-          windowHours: RECOVERY_WINDOW_HOURS,
-          budgetTokens: RECOVERY_BUDGET_TOKENS
-        });
+      if (RECOVERY_MODE === "off") {
+        logger.debug("HOOK", "Recovery mode disabled via CLAUDE_RECALL_RECOVERY_MODE=off");
         return {
           hookSpecificOutput: {
             hookEventName: "SessionStart",
-            additionalContext: recoveryContext + RECALL_USAGE_FOOTER
+            additionalContext: RECALL_USAGE_FOOTER.trim()
           }
         };
+      }
+      if (RECOVERY_MODE === "full") {
+        const recoveryContext = buildRecoveryContext(db, projects);
+        if (recoveryContext) {
+          logger.debug("HOOK", "Recovery mode active", {
+            contextLength: recoveryContext.length,
+            windowHours: RECOVERY_WINDOW_HOURS,
+            budgetTokens: RECOVERY_BUDGET_TOKENS
+          });
+          return {
+            hookSpecificOutput: {
+              hookEventName: "SessionStart",
+              additionalContext: recoveryContext + RECALL_USAGE_FOOTER
+            }
+          };
+        }
       }
       const placeholders = projects.map(() => "?").join(",");
       const sessions = db.prepare(

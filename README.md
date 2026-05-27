@@ -183,10 +183,17 @@ expects seconds but the env var is in milliseconds. Let me trace through...
 
 **Configurable via env vars:**
 ```bash
-CLAUDE_RECALL_RECOVERY_WINDOW_HOURS=24      # how recent counts as "recovery"
-CLAUDE_RECALL_RECOVERY_BUDGET_TOKENS=200000 # max tokens to inject (default 200K)
-                                             # set to 1000000 if on extended (1M) context
+CLAUDE_RECALL_RECOVERY_MODE=full             # 'full' (default), 'summary', or 'off'
+CLAUDE_RECALL_RECOVERY_WINDOW_HOURS=24       # how recent counts as "recovery"
+CLAUDE_RECALL_RECOVERY_BUDGET_TOKENS=200000  # max tokens to inject (default 200K)
+                                              # set to 1000000 if on extended (1M) context
 ```
+
+| Mode | Behavior |
+|------|----------|
+| `full` | Full-fidelity dump of recent sessions (default) |
+| `summary` | Compact ~2K token summary only — lightweight context |
+| `off` | No auto-injection — use MCP search tools on demand |
 
 The system dumps everything within the window **up to** the budget — it doesn't pad to fill it. A 40K-token session injects 40K, not 200K.
 
@@ -849,6 +856,7 @@ scripts/
 |----------|---------|-------------|
 | `CLAUDE_RECALL_DATA_DIR` | `~/.claude-recall` | Data directory for DB and logs |
 | `CLAUDE_RECALL_LOG_LEVEL` | `INFO` | Log verbosity (DEBUG, INFO, WARN, ERROR, SILENT) |
+| `CLAUDE_RECALL_RECOVERY_MODE` | `full` | Recovery behavior: `full` (default), `summary` (compact ~2K tokens), `off` (no auto-injection) |
 | `CLAUDE_RECALL_RECOVERY_WINDOW_HOURS` | `24` | How recent activity must be to trigger Recovery Mode |
 | `CLAUDE_RECALL_RECOVERY_BUDGET_TOKENS` | `200000` | Max tokens injected in Recovery Mode (set `1000000` for extended context) |
 | `CLAUDE_RECALL_WORKER_PORT` | `37777` | Legacy — not used in direct SQLite mode |

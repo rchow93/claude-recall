@@ -13,6 +13,7 @@
  *    For when you're returning to a project after days/weeks away.
  *
  * Configurable via env vars:
+ *   CLAUDE_RECALL_RECOVERY_MODE           (default: 'full') — 'full', 'summary', or 'off'
  *   CLAUDE_RECALL_RECOVERY_WINDOW_HOURS   (default: 24)
  *   CLAUDE_RECALL_RECOVERY_BUDGET_TOKENS  (default: 200000, max practical: 1000000)
  *
@@ -30,6 +31,9 @@ import { logger } from '../../utils/logger.js';
 
 /** Compact summary budget (fallback mode): ~2000 tokens */
 const MAX_SUMMARY_CHARS = 8000;
+
+/** Recovery mode: 'full' (default), 'summary' (compact only), 'off' (no auto-injection) */
+const RECOVERY_MODE = (process.env.CLAUDE_RECALL_RECOVERY_MODE ?? 'full').toLowerCase();
 
 /** Recovery window in hours — how recent must activity be to trigger recovery mode */
 const RECOVERY_WINDOW_HOURS = Number(process.env.CLAUDE_RECALL_RECOVERY_WINDOW_HOURS) || 24;
@@ -476,21 +480,33 @@ export const contextHandler: EventHandler = {
     try {
       const projects = context.allProjects;
 
-      // ─── RECOVERY MODE ───
-      // If there's recent activity within the window, dump it in full fidelity.
-      const recoveryContext = buildRecoveryContext(db, projects);
-      if (recoveryContext) {
-        logger.debug('HOOK', 'Recovery mode active', {
-          contextLength: recoveryContext.length,
-          windowHours: RECOVERY_WINDOW_HOURS,
-          budgetTokens: RECOVERY_BUDGET_TOKENS
-        });
+      if (RECOVERY_MODE === 'off') {
+        logger.debug('HOOK', 'Recovery mode disabled via CLAUDE_RECALL_RECOVERY_MODE=off');
         return {
           hookSpecificOutput: {
             hookEventName: 'SessionStart',
-            additionalContext: recoveryContext + RECALL_USAGE_FOOTER
+            additionalContext: RECALL_USAGE_FOOTER.trim()
           }
         };
+      }
+
+      // ─── RECOVERY MODE ───
+      // If there's recent activity within the window, dump it in full fidelity.
+      if (RECOVERY_MODE === 'full') {
+        const recoveryContext = buildRecoveryContext(db, projects);
+        if (recoveryContext) {
+          logger.debug('HOOK', 'Recovery mode active', {
+            contextLength: recoveryContext.length,
+            windowHours: RECOVERY_WINDOW_HOURS,
+            budgetTokens: RECOVERY_BUDGET_TOKENS
+          });
+          return {
+            hookSpecificOutput: {
+              hookEventName: 'SessionStart',
+              additionalContext: recoveryContext + RECALL_USAGE_FOOTER
+            }
+          };
+        }
       }
 
       // ─── SUMMARY MODE (fallback) ───
