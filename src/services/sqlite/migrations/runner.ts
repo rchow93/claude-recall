@@ -37,6 +37,7 @@ export class MigrationRunner {
     this.createConsolidatedSessionsTable();
     this.addModelAndUsageTracking();
     this.addEncryptionColumns();
+    this.createInterSessionMessagesTable();
   }
 
   /**
@@ -860,5 +861,54 @@ export class MigrationRunner {
     }
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(26, new Date().toISOString());
+  }
+
+  /**
+   * Create inter_session_messages table for cross-session communication (migration 27)
+   *
+   * Enables Claude Code sessions to send messages to other projects' sessions.
+   * Messages are routed through the shared DB, approved by the operator via
+   * the pro dashboard, and delivered via PostToolUse hook additionalContext injection.
+   */
+  private createInterSessionMessagesTable(): void {
+    const applied = this.db.prepare('SELECT 1 FROM schema_versions WHERE version = 27').get();
+    if (applied) return;
+
+    const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='inter_session_messages'").all() as TableNameRow[];
+    if (tables.length === 0) {
+      this.db.run(`
+        CREATE TABLE inter_session_messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source_project TEXT NOT NULL,
+          source_session_id TEXT NOT NULL,
+          target_project TEXT NOT NULL,
+          message_type TEXT NOT NULL DEFAULT 'request'
+            CHECK(message_type IN ('request', 'notify', 'question', 'reply')),
+          priority TEXT NOT NULL DEFAULT 'normal'
+            CHECK(priority IN ('low', 'normal', 'high', 'urgent')),
+          subject TEXT,
+          body TEXT NOT NULL,
+          parent_message_id INTEGER,
+          status TEXT NOT NULL DEFAULT 'pending_approval'
+            CHECK(status IN ('pending_approval', 'approved', 'delivered', 'completed', 'rejected', 'expired')),
+          created_at_epoch INTEGER NOT NULL,
+          approved_at_epoch INTEGER,
+          delivered_at_epoch INTEGER,
+          completed_at_epoch INTEGER,
+          response_body TEXT,
+          encrypted INTEGER DEFAULT 0,
+          ttl_seconds INTEGER DEFAULT 86400
+        )
+      `);
+
+      this.db.run('CREATE INDEX idx_ism_target_status ON inter_session_messages(target_project, status)');
+      this.db.run('CREATE INDEX idx_ism_source ON inter_session_messages(source_project, created_at_epoch DESC)');
+      this.db.run('CREATE INDEX idx_ism_created ON inter_session_messages(created_at_epoch DESC)');
+      this.db.run('CREATE INDEX idx_ism_parent ON inter_session_messages(parent_message_id)');
+
+      logger.debug('DB', 'Created inter_session_messages table with 4 indexes');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(27, new Date().toISOString());
   }
 }
