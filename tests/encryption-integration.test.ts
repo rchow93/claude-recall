@@ -88,11 +88,19 @@ describe('FTS5 search still works with encrypted tool_response', () => {
       [sessionId]
     );
 
+    const plainInput = '{"command":"grep -r uniqueSearchTerm123 ."}';
     const encResponse = encrypt('secret response data', key);
     db.run(
       `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, relevance_score, redacted, encrypted)
-       VALUES (?, 'fts-project', 'Bash', '{"command":"grep -r uniqueSearchTerm123 ."}', ?, '/tmp', 1, '2026-06-11T00:01:00Z', 1749600060, 0.7, 0, 1)`,
-      [sessionId, encResponse]
+       VALUES (?, 'fts-project', 'Bash', ?, ?, '/tmp', 1, '2026-06-11T00:01:00Z', 1749600060, 0.7, 0, 1)`,
+      [sessionId, plainInput, encResponse]
+    );
+
+    // Manual FTS5 insert (triggers dropped in migration 28)
+    const lastId = (db.prepare('SELECT last_insert_rowid() as id').get() as { id: number }).id;
+    db.run(
+      `INSERT INTO raw_observations_fts(rowid, tool_name, tool_input) VALUES (?, 'Bash', ?)`,
+      [lastId, plainInput]
     );
 
     // FTS5 should find by tool_input content

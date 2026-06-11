@@ -597,6 +597,7 @@ var MigrationRunner = class {
     this.addModelAndUsageTracking();
     this.addEncryptionColumns();
     this.createInterSessionMessagesTable();
+    this.dropFtsTrigersForFieldEncryption();
   }
   /**
    * Initialize database schema using migrations (migration004)
@@ -1269,6 +1270,29 @@ var MigrationRunner = class {
     }
     this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(27, (/* @__PURE__ */ new Date()).toISOString());
   }
+  /**
+   * Drop FTS5 auto-sync triggers for field-level encryption (migration 28)
+   *
+   * With field-level encryption on tool_input and prompt_text, the INSERT
+   * triggers would feed ciphertext into FTS5 indexes, breaking search.
+   * Application code now manages FTS5 inserts manually with plaintext
+   * while storing encrypted data in the primary columns.
+   *
+   * Trade-off (option a): FTS5 indexes retain plaintext tokens for search;
+   * primary columns are encrypted. The FTS5 gap is documented.
+   */
+  dropFtsTrigersForFieldEncryption() {
+    const applied = this.db.prepare("SELECT 1 FROM schema_versions WHERE version = 28").get();
+    if (applied) return;
+    this.db.run("DROP TRIGGER IF EXISTS raw_obs_ai");
+    this.db.run("DROP TRIGGER IF EXISTS raw_obs_ad");
+    this.db.run("DROP TRIGGER IF EXISTS raw_obs_au");
+    this.db.run("DROP TRIGGER IF EXISTS user_prompts_ai");
+    this.db.run("DROP TRIGGER IF EXISTS user_prompts_ad");
+    this.db.run("DROP TRIGGER IF EXISTS user_prompts_au");
+    logger.debug("DB", "Dropped FTS5 auto-sync triggers for field-level encryption (migration 28)");
+    this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(28, (/* @__PURE__ */ new Date()).toISOString());
+  }
 };
 
 // src/services/sqlite/DirectDB.ts
@@ -1510,33 +1534,79 @@ function encryptExistingData(db) {
   const unencryptedObs = db.prepare(
     "SELECT COUNT(*) as cnt FROM raw_observations WHERE encrypted = 0 AND tool_response IS NOT NULL"
   ).get()?.cnt ?? 0;
+  const plaintextInputCount = db.prepare(
+    `SELECT COUNT(*) as cnt FROM raw_observations
+     WHERE encrypted = 1 AND tool_input IS NOT NULL AND tool_input NOT LIKE '$ENCRYPTED$%'`
+  ).get()?.cnt ?? 0;
+  const unencryptedPrompts = db.prepare(
+    "SELECT COUNT(*) as cnt FROM user_prompts WHERE encrypted = 0 AND prompt_text IS NOT NULL"
+  ).get()?.cnt ?? 0;
   const unencryptedCons = db.prepare(
     "SELECT COUNT(*) as cnt FROM consolidated_sessions WHERE encrypted = 0"
   ).get()?.cnt ?? 0;
-  if (unencryptedObs === 0 && unencryptedCons === 0) return;
-  logger.info("ENCRYPTION", `Encrypting existing data: ${unencryptedObs} observations, ${unencryptedCons} consolidated sessions`);
+  if (unencryptedObs === 0 && plaintextInputCount === 0 && unencryptedPrompts === 0 && unencryptedCons === 0) return;
+  logger.info("ENCRYPTION", `Encrypting existing data: ${unencryptedObs} obs (response), ${plaintextInputCount} obs (input), ${unencryptedPrompts} prompts, ${unencryptedCons} consolidated`);
   let obsEncrypted = 0;
-  const updateObs = db.prepare("UPDATE raw_observations SET tool_response = ?, encrypted = 1 WHERE id = ?");
   while (true) {
     const rows = db.prepare(
-      "SELECT id, tool_response FROM raw_observations WHERE encrypted = 0 AND tool_response IS NOT NULL LIMIT ?"
+      "SELECT id, tool_response, tool_input FROM raw_observations WHERE encrypted = 0 AND (tool_response IS NOT NULL OR tool_input IS NOT NULL) LIMIT ?"
     ).all(BATCH_SIZE);
     if (rows.length === 0) break;
     const tx = db.transaction(() => {
       for (const row of rows) {
         try {
-          const encrypted = encrypt(row.tool_response, key);
-          updateObs.run(encrypted, row.id);
+          const encResponse = row.tool_response ? encrypt(row.tool_response, key) : null;
+          const encInput = row.tool_input ? encrypt(row.tool_input, key) : null;
+          db.run(
+            "UPDATE raw_observations SET tool_response = ?, tool_input = ?, encrypted = 1 WHERE id = ?",
+            [encResponse ?? row.tool_response, encInput ?? row.tool_input, row.id]
+          );
           obsEncrypted++;
         } catch {
-          db.run("UPDATE raw_observations SET encrypted = 0 WHERE id = ?", [row.id]);
+        }
+      }
+    });
+    tx();
+  }
+  let inputsEncrypted = 0;
+  while (true) {
+    const rows = db.prepare(
+      `SELECT id, tool_input FROM raw_observations
+       WHERE encrypted = 1 AND tool_input IS NOT NULL AND tool_input NOT LIKE '$ENCRYPTED$%'
+       LIMIT ?`
+    ).all(BATCH_SIZE);
+    if (rows.length === 0) break;
+    const tx = db.transaction(() => {
+      for (const row of rows) {
+        try {
+          const encInput = encrypt(row.tool_input, key);
+          db.run("UPDATE raw_observations SET tool_input = ? WHERE id = ?", [encInput, row.id]);
+          inputsEncrypted++;
+        } catch {
+        }
+      }
+    });
+    tx();
+  }
+  let promptsEncrypted = 0;
+  while (true) {
+    const rows = db.prepare(
+      "SELECT id, prompt_text FROM user_prompts WHERE encrypted = 0 AND prompt_text IS NOT NULL LIMIT ?"
+    ).all(BATCH_SIZE);
+    if (rows.length === 0) break;
+    const tx = db.transaction(() => {
+      for (const row of rows) {
+        try {
+          const enc = encrypt(row.prompt_text, key);
+          db.run("UPDATE user_prompts SET prompt_text = ?, encrypted = 1 WHERE id = ?", [enc, row.id]);
+          promptsEncrypted++;
+        } catch {
         }
       }
     });
     tx();
   }
   let consEncrypted = 0;
-  const updateCons = db.prepare("UPDATE consolidated_sessions SET summary = ?, encrypted = 1 WHERE id = ?");
   while (true) {
     const rows = db.prepare(
       "SELECT id, summary FROM consolidated_sessions WHERE encrypted = 0 LIMIT ?"
@@ -1545,17 +1615,16 @@ function encryptExistingData(db) {
     const tx = db.transaction(() => {
       for (const row of rows) {
         try {
-          const encrypted = encrypt(row.summary, key);
-          updateCons.run(encrypted, row.id);
+          const enc = encrypt(row.summary, key);
+          db.run("UPDATE consolidated_sessions SET summary = ?, encrypted = 1 WHERE id = ?", [enc, row.id]);
           consEncrypted++;
         } catch {
-          db.run("UPDATE consolidated_sessions SET encrypted = 0 WHERE id = ?", [row.id]);
         }
       }
     });
     tx();
   }
-  logger.info("ENCRYPTION", `Encrypted ${obsEncrypted} observations, ${consEncrypted} consolidated sessions`);
+  logger.info("ENCRYPTION", `Encrypted ${obsEncrypted} obs (full), ${inputsEncrypted} obs (input only), ${promptsEncrypted} prompts, ${consEncrypted} consolidated`);
 }
 
 // src/cli/handlers/context.ts
@@ -1588,7 +1657,8 @@ function formatTimeAgo(epoch, now) {
   return `${d} day${d === 1 ? "" : "s"} ago`;
 }
 function formatToolUse(o) {
-  let input = o.tool_input;
+  const decryptedInput = tryDecrypt(o.tool_input, o.encrypted) ?? o.tool_input;
+  let input = decryptedInput;
   try {
     input = JSON.parse(input ?? "");
   } catch {
@@ -1662,10 +1732,14 @@ function buildRecoveryContext(db, projects) {
 }
 function buildSessionDump(db, session, budget) {
   const sid = session.content_session_id;
-  const prompts = db.prepare(
-    `SELECT prompt_number, prompt_text FROM user_prompts
+  const promptsRaw = db.prepare(
+    `SELECT prompt_number, prompt_text, encrypted FROM user_prompts
      WHERE content_session_id = ? ORDER BY prompt_number ASC`
   ).all(sid);
+  const prompts = promptsRaw.map((p) => ({
+    ...p,
+    prompt_text: tryDecrypt(p.prompt_text, p.encrypted) ?? p.prompt_text
+  }));
   const observations = db.prepare(
     `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number, encrypted
      FROM raw_observations
@@ -1741,10 +1815,14 @@ function buildSessionDump(db, session, budget) {
 }
 function buildCompactSummary(db, session) {
   const sid = session.content_session_id;
-  const prompts = db.prepare(
-    `SELECT prompt_number, prompt_text FROM user_prompts
+  const promptsRaw = db.prepare(
+    `SELECT prompt_number, prompt_text, encrypted FROM user_prompts
      WHERE content_session_id = ? ORDER BY prompt_number ASC`
   ).all(sid);
+  const prompts = promptsRaw.map((p) => ({
+    ...p,
+    prompt_text: tryDecrypt(p.prompt_text, p.encrypted) ?? p.prompt_text
+  }));
   const observations = db.prepare(
     `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number, encrypted
      FROM raw_observations
@@ -1771,7 +1849,8 @@ function buildCompactSummary(db, session) {
   const filesTouched = /* @__PURE__ */ new Set();
   const commandsRun = [];
   for (const o of observations) {
-    let input = o.tool_input;
+    const decryptedInput = tryDecrypt(o.tool_input, o.encrypted) ?? o.tool_input;
+    let input = decryptedInput;
     try {
       input = JSON.parse(input ?? "");
     } catch {
@@ -1843,7 +1922,7 @@ function getConsolidatedContext(db, projects, currentLength) {
   let rows;
   try {
     rows = db.prepare(
-      `SELECT project, summary, prompt_count, tool_use_count, original_started_at
+      `SELECT project, summary, prompt_count, tool_use_count, original_started_at, encrypted
        FROM consolidated_sessions
        WHERE project IN (${placeholders})
        ORDER BY original_started_at_epoch DESC
@@ -1857,7 +1936,8 @@ function getConsolidatedContext(db, projects, currentLength) {
   let used = lines[0].length;
   for (const r of rows) {
     if (used > budget) break;
-    const snippet = r.summary.length > 150 ? r.summary.slice(0, 150) + "..." : r.summary;
+    const summaryText = tryDecrypt(r.summary, r.encrypted ?? 0) ?? r.summary;
+    const snippet = summaryText.length > 150 ? summaryText.slice(0, 150) + "..." : summaryText;
     const line = `- **${r.original_started_at.split("T")[0]}** (${r.prompt_count}p/${r.tool_use_count}t): ${snippet.replace(/\n/g, " ")}`;
     lines.push(line);
     used += line.length;
@@ -2057,11 +2137,25 @@ var sessionInitHandler = {
           "SELECT id, prompt_counter FROM sdk_sessions WHERE content_session_id = ?"
         ).get(sessionId);
         const promptNumber = session.prompt_counter;
-        const promptText = isPrivate ? "[PRIVATE - prompt not stored]" : prompt;
+        const plaintextPrompt = isPrivate ? "[PRIVATE - prompt not stored]" : prompt;
+        let storedPrompt = plaintextPrompt;
+        let promptEncrypted = 0;
+        if (encryptionEnabled() && !isPrivate) {
+          try {
+            storedPrompt = encrypt(plaintextPrompt, getEncryptionKey());
+            promptEncrypted = 1;
+          } catch {
+          }
+        }
         db.run(
-          `INSERT INTO user_prompts (content_session_id, prompt_number, prompt_text, created_at, created_at_epoch)
-           VALUES (?, ?, ?, ?, ?)`,
-          [sessionId, promptNumber, promptText, nowIso, nowEpoch]
+          `INSERT INTO user_prompts (content_session_id, prompt_number, prompt_text, created_at, created_at_epoch, encrypted)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [sessionId, promptNumber, storedPrompt, nowIso, nowEpoch, promptEncrypted]
+        );
+        const lastPromptId = db.prepare("SELECT last_insert_rowid() as id").get();
+        db.run(
+          `INSERT INTO user_prompts_fts(rowid, prompt_text) VALUES (?, ?)`,
+          [lastPromptId.id, plaintextPrompt]
         );
         return { sessionDbId: session.id, promptNumber };
       });
@@ -2456,6 +2550,12 @@ function captureTranscript(db, sessionId, project, cwd, transcriptPath, nowEpoch
     } catch {
     }
   }
+  const oldRows = db.prepare(
+    `SELECT id FROM raw_observations WHERE content_session_id = ? AND tool_name = '_assistant_responses'`
+  ).all(sessionId);
+  for (const row of oldRows) {
+    db.run(`INSERT INTO raw_observations_fts(raw_observations_fts, rowid, tool_name, tool_input) VALUES('delete', ?, '_assistant_responses', NULL)`, [row.id]);
+  }
   db.run(
     `DELETE FROM raw_observations WHERE content_session_id = ? AND tool_name = '_assistant_responses'`,
     [sessionId]
@@ -2464,6 +2564,11 @@ function captureTranscript(db, sessionId, project, cwd, transcriptPath, nowEpoch
     `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, encrypted)
      VALUES (?, ?, '_assistant_responses', NULL, ?, ?, ?, ?, ?, ?)`,
     [sessionId, project, capped, cwd, promptNumber, (/* @__PURE__ */ new Date()).toISOString(), nowEpoch, transcriptEncrypted]
+  );
+  const lastTranscriptId = db.prepare("SELECT last_insert_rowid() as id").get();
+  db.run(
+    `INSERT INTO raw_observations_fts(rowid, tool_name, tool_input) VALUES (?, '_assistant_responses', NULL)`,
+    [lastTranscriptId.id]
   );
   logger.debug("HOOK", `Captured ${responses.length} assistant responses from transcript`);
 }
@@ -2506,14 +2611,34 @@ var observationHandler = {
         responseStr = redactSensitiveContent(responseStr);
         redacted = 1;
       }
-      const recentTools = db.prepare(
-        `SELECT tool_name, tool_input FROM raw_observations
+      const recentToolsRaw = db.prepare(
+        `SELECT tool_name, tool_input, encrypted FROM raw_observations
          WHERE content_session_id = ? ORDER BY id DESC LIMIT 5`
       ).all(sessionId);
-      const lastPrompt = db.prepare(
-        `SELECT prompt_text FROM user_prompts
+      const encKey = encryptionEnabled() ? getEncryptionKey() : null;
+      const recentTools = recentToolsRaw.map((r) => ({
+        tool_name: r.tool_name,
+        tool_input: r.encrypted && r.tool_input && encKey ? (() => {
+          try {
+            return decrypt(r.tool_input, encKey);
+          } catch {
+            return r.tool_input;
+          }
+        })() : r.tool_input
+      }));
+      const lastPromptRaw = db.prepare(
+        `SELECT prompt_text, encrypted FROM user_prompts
          WHERE content_session_id = ? ORDER BY prompt_number DESC LIMIT 1`
       ).get(sessionId);
+      const lastPrompt = lastPromptRaw ? {
+        prompt_text: lastPromptRaw.encrypted && encKey ? (() => {
+          try {
+            return decrypt(lastPromptRaw.prompt_text, encKey);
+          } catch {
+            return lastPromptRaw.prompt_text;
+          }
+        })() : lastPromptRaw.prompt_text
+      } : void 0;
       const relevanceScore = computeRelevanceScore({
         toolName,
         toolInput,
@@ -2523,20 +2648,27 @@ var observationHandler = {
       });
       const usage = transcriptPath ? extractLatestUsage(transcriptPath) : null;
       const model = usage?.model ?? null;
+      const plaintextInput = inputStr;
       let encrypted = 0;
-      if (encryptionEnabled() && responseStr) {
+      if (encryptionEnabled()) {
         try {
           const key = getEncryptionKey();
-          responseStr = encrypt(responseStr, key);
+          if (responseStr) responseStr = encrypt(responseStr, key);
+          if (inputStr) inputStr = encrypt(inputStr, key);
           encrypted = 1;
         } catch (err) {
-          logger.warn("ENCRYPTION", "Failed to encrypt tool_response, storing plaintext", void 0, err);
+          logger.warn("ENCRYPTION", "Failed to encrypt fields, storing plaintext", void 0, err);
         }
       }
       db.run(
         `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, relevance_score, redacted, model, encrypted)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [sessionId, project, toolName, inputStr, responseStr, cwd, promptNumber, now.toISOString(), nowEpoch, relevanceScore, redacted, model, encrypted]
+      );
+      const lastId = db.prepare("SELECT last_insert_rowid() as id").get();
+      db.run(
+        `INSERT INTO raw_observations_fts(rowid, tool_name, tool_input) VALUES (?, ?, ?)`,
+        [lastId.id, toolName, plaintextInput]
       );
       if (usage && promptNumber > 0) {
         const costUsd = estimateCostUsd(usage);

@@ -65,6 +65,7 @@ function tryDecrypt(value: string | null, rowEncrypted: number): string | null {
 interface PromptRow {
   prompt_number: number;
   prompt_text: string;
+  encrypted: number;
 }
 
 interface SessionRow {
@@ -102,7 +103,8 @@ function formatTimeAgo(epoch: number, now: number): string {
  * Format a tool use for the recovery dump — compact but informative.
  */
 function formatToolUse(o: RawObsRow): string {
-  let input: any = o.tool_input;
+  const decryptedInput = tryDecrypt(o.tool_input, o.encrypted) ?? o.tool_input;
+  let input: any = decryptedInput;
   try { input = JSON.parse(input ?? ''); } catch {}
 
   if (['Read', 'Write', 'Edit'].includes(o.tool_name) && input?.file_path) {
@@ -193,10 +195,14 @@ function buildRecoveryContext(db: any, projects: string[]): string | null {
 function buildSessionDump(db: any, session: SessionWithActivity, budget: number): string {
   const sid = session.content_session_id;
 
-  const prompts = db.prepare(
-    `SELECT prompt_number, prompt_text FROM user_prompts
+  const promptsRaw = db.prepare(
+    `SELECT prompt_number, prompt_text, encrypted FROM user_prompts
      WHERE content_session_id = ? ORDER BY prompt_number ASC`
   ).all(sid) as PromptRow[];
+  const prompts = promptsRaw.map(p => ({
+    ...p,
+    prompt_text: tryDecrypt(p.prompt_text, p.encrypted) ?? p.prompt_text,
+  }));
 
   const observations = db.prepare(
     `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number, encrypted
@@ -286,10 +292,14 @@ function buildSessionDump(db: any, session: SessionWithActivity, budget: number)
 function buildCompactSummary(db: any, session: SessionRow): string {
   const sid = session.content_session_id;
 
-  const prompts = db.prepare(
-    `SELECT prompt_number, prompt_text FROM user_prompts
+  const promptsRaw = db.prepare(
+    `SELECT prompt_number, prompt_text, encrypted FROM user_prompts
      WHERE content_session_id = ? ORDER BY prompt_number ASC`
   ).all(sid) as PromptRow[];
+  const prompts = promptsRaw.map(p => ({
+    ...p,
+    prompt_text: tryDecrypt(p.prompt_text, p.encrypted) ?? p.prompt_text,
+  }));
 
   const observations = db.prepare(
     `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number, encrypted
@@ -317,7 +327,8 @@ function buildCompactSummary(db: any, session: SessionRow): string {
   const filesTouched = new Set<string>();
   const commandsRun: string[] = [];
   for (const o of observations) {
-    let input: any = o.tool_input;
+    const decryptedInput = tryDecrypt(o.tool_input, o.encrypted) ?? o.tool_input;
+    let input: any = decryptedInput;
     try { input = JSON.parse(input ?? ''); } catch {}
 
     if (['Read', 'Write', 'Edit'].includes(o.tool_name) && input?.file_path) {
@@ -391,10 +402,10 @@ function getConsolidatedContext(db: any, projects: string[], currentLength: numb
   if (budget < 200) return '';
 
   const placeholders = projects.map(() => '?').join(',');
-  let rows: Array<{ project: string; summary: string; prompt_count: number; tool_use_count: number; original_started_at: string }>;
+  let rows: Array<{ project: string; summary: string; prompt_count: number; tool_use_count: number; original_started_at: string; encrypted: number }>;
   try {
     rows = db.prepare(
-      `SELECT project, summary, prompt_count, tool_use_count, original_started_at
+      `SELECT project, summary, prompt_count, tool_use_count, original_started_at, encrypted
        FROM consolidated_sessions
        WHERE project IN (${placeholders})
        ORDER BY original_started_at_epoch DESC
@@ -411,7 +422,8 @@ function getConsolidatedContext(db: any, projects: string[], currentLength: numb
 
   for (const r of rows) {
     if (used > budget) break;
-    const snippet = r.summary.length > 150 ? r.summary.slice(0, 150) + '...' : r.summary;
+    const summaryText = tryDecrypt(r.summary, r.encrypted ?? 0) ?? r.summary;
+    const snippet = summaryText.length > 150 ? summaryText.slice(0, 150) + '...' : summaryText;
     const line = `- **${r.original_started_at.split('T')[0]}** (${r.prompt_count}p/${r.tool_use_count}t): ${snippet.replace(/\n/g, ' ')}`;
     lines.push(line);
     used += line.length;

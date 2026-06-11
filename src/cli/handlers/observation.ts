@@ -16,7 +16,7 @@ import { computeRelevanceScore } from './relevance.js';
 import { redactSensitiveContent, containsSensitivePatterns } from '../../utils/privacy.js';
 import { consolidateOldSessions, applyTimeDecay, smartCleanup } from '../../services/consolidation.js';
 import { extractLatestUsage, estimateCostUsd } from '../../utils/transcript-usage.js';
-import { encrypt } from '../../services/encryption.js';
+import { encrypt, decrypt } from '../../services/encryption.js';
 import { getEncryptionKey, encryptionEnabled } from '../../services/key-management.js';
 
 /** Max size for tool_response storage (50KB). Larger responses are truncated. */
@@ -114,6 +114,13 @@ function captureTranscript(db: any, sessionId: string, project: string, cwd: str
   }
 
   // Delete previous snapshot for this session, insert fresh one
+  // Also clean up FTS5 entries for deleted rows (triggers dropped in migration 28)
+  const oldRows = db.prepare(
+    `SELECT id FROM raw_observations WHERE content_session_id = ? AND tool_name = '_assistant_responses'`
+  ).all(sessionId) as Array<{ id: number }>;
+  for (const row of oldRows) {
+    db.run(`INSERT INTO raw_observations_fts(raw_observations_fts, rowid, tool_name, tool_input) VALUES('delete', ?, '_assistant_responses', NULL)`, [row.id]);
+  }
   db.run(
     `DELETE FROM raw_observations WHERE content_session_id = ? AND tool_name = '_assistant_responses'`,
     [sessionId]
@@ -122,6 +129,11 @@ function captureTranscript(db: any, sessionId: string, project: string, cwd: str
     `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, encrypted)
      VALUES (?, ?, '_assistant_responses', NULL, ?, ?, ?, ?, ?, ?)`,
     [sessionId, project, capped, cwd, promptNumber, new Date().toISOString(), nowEpoch, transcriptEncrypted]
+  );
+  const lastTranscriptId = db.prepare('SELECT last_insert_rowid() as id').get() as { id: number };
+  db.run(
+    `INSERT INTO raw_observations_fts(rowid, tool_name, tool_input) VALUES (?, '_assistant_responses', NULL)`,
+    [lastTranscriptId.id]
   );
 
   logger.debug('HOOK', `Captured ${responses.length} assistant responses from transcript`);
@@ -181,15 +193,29 @@ export const observationHandler: EventHandler = {
       }
 
       // Compute relevance score for smart prioritization
-      const recentTools = db.prepare(
-        `SELECT tool_name, tool_input FROM raw_observations
+      const recentToolsRaw = db.prepare(
+        `SELECT tool_name, tool_input, encrypted FROM raw_observations
          WHERE content_session_id = ? ORDER BY id DESC LIMIT 5`
-      ).all(sessionId) as Array<{ tool_name: string; tool_input: string | null }>;
+      ).all(sessionId) as Array<{ tool_name: string; tool_input: string | null; encrypted: number }>;
 
-      const lastPrompt = db.prepare(
-        `SELECT prompt_text FROM user_prompts
+      const encKey = encryptionEnabled() ? getEncryptionKey() : null;
+      const recentTools = recentToolsRaw.map(r => ({
+        tool_name: r.tool_name,
+        tool_input: r.encrypted && r.tool_input && encKey
+          ? (() => { try { return decrypt(r.tool_input, encKey); } catch { return r.tool_input; } })()
+          : r.tool_input,
+      }));
+
+      const lastPromptRaw = db.prepare(
+        `SELECT prompt_text, encrypted FROM user_prompts
          WHERE content_session_id = ? ORDER BY prompt_number DESC LIMIT 1`
-      ).get(sessionId) as { prompt_text: string } | undefined;
+      ).get(sessionId) as { prompt_text: string; encrypted: number } | undefined;
+
+      const lastPrompt = lastPromptRaw ? {
+        prompt_text: lastPromptRaw.encrypted && encKey
+          ? (() => { try { return decrypt(lastPromptRaw.prompt_text, encKey); } catch { return lastPromptRaw.prompt_text; } })()
+          : lastPromptRaw.prompt_text,
+      } : undefined;
 
       const relevanceScore = computeRelevanceScore({
         toolName,
@@ -203,15 +229,18 @@ export const observationHandler: EventHandler = {
       const usage = transcriptPath ? extractLatestUsage(transcriptPath) : null;
       const model = usage?.model ?? null;
 
-      // Encrypt tool_response at rest (tool_input stays plaintext for FTS5 search)
+      // Encrypt tool_response and tool_input at rest
+      // FTS5 index is maintained manually with plaintext (triggers dropped in migration 28)
+      const plaintextInput = inputStr;
       let encrypted = 0;
-      if (encryptionEnabled() && responseStr) {
+      if (encryptionEnabled()) {
         try {
           const key = getEncryptionKey();
-          responseStr = encrypt(responseStr, key);
+          if (responseStr) responseStr = encrypt(responseStr, key);
+          if (inputStr) inputStr = encrypt(inputStr, key);
           encrypted = 1;
         } catch (err) {
-          logger.warn('ENCRYPTION', 'Failed to encrypt tool_response, storing plaintext', undefined, err as Error);
+          logger.warn('ENCRYPTION', 'Failed to encrypt fields, storing plaintext', undefined, err as Error);
         }
       }
 
@@ -219,6 +248,13 @@ export const observationHandler: EventHandler = {
         `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, relevance_score, redacted, model, encrypted)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [sessionId, project, toolName, inputStr, responseStr, cwd, promptNumber, now.toISOString(), nowEpoch, relevanceScore, redacted, model, encrypted]
+      );
+
+      // Manual FTS5 insert with plaintext (triggers dropped in migration 28)
+      const lastId = db.prepare('SELECT last_insert_rowid() as id').get() as { id: number };
+      db.run(
+        `INSERT INTO raw_observations_fts(rowid, tool_name, tool_input) VALUES (?, ?, ?)`,
+        [lastId.id, toolName, plaintextInput]
       );
 
       // Upsert per-turn usage into api_usage (deduped by session + prompt_number)

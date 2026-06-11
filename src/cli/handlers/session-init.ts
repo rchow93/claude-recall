@@ -11,6 +11,8 @@ import { openDatabase } from '../../services/sqlite/DirectDB.js';
 import { getProjectName } from '../../utils/project-name.js';
 import { logger } from '../../utils/logger.js';
 import { isPrivatePrompt } from '../../utils/privacy.js';
+import { encrypt } from '../../services/encryption.js';
+import { getEncryptionKey, encryptionEnabled } from '../../services/key-management.js';
 
 export const sessionInitHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
@@ -49,12 +51,27 @@ export const sessionInitHandler: EventHandler = {
 
         const promptNumber = session.prompt_counter;
 
-        // Store the user prompt (redacted if private)
-        const promptText = isPrivate ? '[PRIVATE - prompt not stored]' : prompt;
+        // Store the user prompt (redacted if private, encrypted at rest)
+        const plaintextPrompt = isPrivate ? '[PRIVATE - prompt not stored]' : prompt;
+        let storedPrompt = plaintextPrompt;
+        let promptEncrypted = 0;
+        if (encryptionEnabled() && !isPrivate) {
+          try {
+            storedPrompt = encrypt(plaintextPrompt, getEncryptionKey());
+            promptEncrypted = 1;
+          } catch { /* fall through to plaintext */ }
+        }
         db.run(
-          `INSERT INTO user_prompts (content_session_id, prompt_number, prompt_text, created_at, created_at_epoch)
-           VALUES (?, ?, ?, ?, ?)`,
-          [sessionId, promptNumber, promptText, nowIso, nowEpoch]
+          `INSERT INTO user_prompts (content_session_id, prompt_number, prompt_text, created_at, created_at_epoch, encrypted)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [sessionId, promptNumber, storedPrompt, nowIso, nowEpoch, promptEncrypted]
+        );
+
+        // Manual FTS5 insert with plaintext (triggers dropped in migration 28)
+        const lastPromptId = db.prepare('SELECT last_insert_rowid() as id').get() as { id: number };
+        db.run(
+          `INSERT INTO user_prompts_fts(rowid, prompt_text) VALUES (?, ?)`,
+          [lastPromptId.id, plaintextPrompt]
         );
 
         return { sessionDbId: session.id, promptNumber };

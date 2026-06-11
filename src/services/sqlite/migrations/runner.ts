@@ -38,6 +38,7 @@ export class MigrationRunner {
     this.addModelAndUsageTracking();
     this.addEncryptionColumns();
     this.createInterSessionMessagesTable();
+    this.dropFtsTrigersForFieldEncryption();
   }
 
   /**
@@ -910,5 +911,33 @@ export class MigrationRunner {
     }
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(27, new Date().toISOString());
+  }
+
+  /**
+   * Drop FTS5 auto-sync triggers for field-level encryption (migration 28)
+   *
+   * With field-level encryption on tool_input and prompt_text, the INSERT
+   * triggers would feed ciphertext into FTS5 indexes, breaking search.
+   * Application code now manages FTS5 inserts manually with plaintext
+   * while storing encrypted data in the primary columns.
+   *
+   * Trade-off (option a): FTS5 indexes retain plaintext tokens for search;
+   * primary columns are encrypted. The FTS5 gap is documented.
+   */
+  private dropFtsTrigersForFieldEncryption(): void {
+    const applied = this.db.prepare('SELECT 1 FROM schema_versions WHERE version = 28').get();
+    if (applied) return;
+
+    this.db.run('DROP TRIGGER IF EXISTS raw_obs_ai');
+    this.db.run('DROP TRIGGER IF EXISTS raw_obs_ad');
+    this.db.run('DROP TRIGGER IF EXISTS raw_obs_au');
+
+    this.db.run('DROP TRIGGER IF EXISTS user_prompts_ai');
+    this.db.run('DROP TRIGGER IF EXISTS user_prompts_ad');
+    this.db.run('DROP TRIGGER IF EXISTS user_prompts_au');
+
+    logger.debug('DB', 'Dropped FTS5 auto-sync triggers for field-level encryption (migration 28)');
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(28, new Date().toISOString());
   }
 }

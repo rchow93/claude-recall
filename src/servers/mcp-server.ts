@@ -477,13 +477,14 @@ function handleGetObservations(args: Record<string, any>): { content: Array<{ ty
 
     for (const r of rawRows) {
       const response = decryptField(r.tool_response, r.encrypted);
+      const input = decryptField(r.tool_input, r.encrypted);
       results.push({
         source: 'raw',
         id: r.id,
         session: r.content_session_id,
         project: r.project,
         tool_name: r.tool_name,
-        tool_input: r.tool_input ? truncate(r.tool_input, maxLen) : null,
+        tool_input: input ? truncate(input, maxLen) : null,
         tool_response: response ? truncate(response, maxLen) : null,
         cwd: r.cwd,
         prompt_number: r.prompt_number,

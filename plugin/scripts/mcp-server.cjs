@@ -21141,6 +21141,7 @@ var MigrationRunner = class {
     this.addModelAndUsageTracking();
     this.addEncryptionColumns();
     this.createInterSessionMessagesTable();
+    this.dropFtsTrigersForFieldEncryption();
   }
   /**
    * Initialize database schema using migrations (migration004)
@@ -21813,6 +21814,29 @@ var MigrationRunner = class {
     }
     this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(27, (/* @__PURE__ */ new Date()).toISOString());
   }
+  /**
+   * Drop FTS5 auto-sync triggers for field-level encryption (migration 28)
+   *
+   * With field-level encryption on tool_input and prompt_text, the INSERT
+   * triggers would feed ciphertext into FTS5 indexes, breaking search.
+   * Application code now manages FTS5 inserts manually with plaintext
+   * while storing encrypted data in the primary columns.
+   *
+   * Trade-off (option a): FTS5 indexes retain plaintext tokens for search;
+   * primary columns are encrypted. The FTS5 gap is documented.
+   */
+  dropFtsTrigersForFieldEncryption() {
+    const applied = this.db.prepare("SELECT 1 FROM schema_versions WHERE version = 28").get();
+    if (applied) return;
+    this.db.run("DROP TRIGGER IF EXISTS raw_obs_ai");
+    this.db.run("DROP TRIGGER IF EXISTS raw_obs_ad");
+    this.db.run("DROP TRIGGER IF EXISTS raw_obs_au");
+    this.db.run("DROP TRIGGER IF EXISTS user_prompts_ai");
+    this.db.run("DROP TRIGGER IF EXISTS user_prompts_ad");
+    this.db.run("DROP TRIGGER IF EXISTS user_prompts_au");
+    logger.debug("DB", "Dropped FTS5 auto-sync triggers for field-level encryption (migration 28)");
+    this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(28, (/* @__PURE__ */ new Date()).toISOString());
+  }
 };
 
 // src/services/sqlite/DirectDB.ts
@@ -22293,13 +22317,14 @@ function handleGetObservations(args) {
     ).all(...rawIds);
     for (const r of rawRows) {
       const response = decryptField(r.tool_response, r.encrypted);
+      const input = decryptField(r.tool_input, r.encrypted);
       results.push({
         source: "raw",
         id: r.id,
         session: r.content_session_id,
         project: r.project,
         tool_name: r.tool_name,
-        tool_input: r.tool_input ? truncate(r.tool_input, maxLen) : null,
+        tool_input: input ? truncate(input, maxLen) : null,
         tool_response: response ? truncate(response, maxLen) : null,
         cwd: r.cwd,
         prompt_number: r.prompt_number,

@@ -19,7 +19,7 @@ bun test                 # run tests
 - `src/cli/handlers/observation.ts` — PostToolUse hook: relevance scoring, redaction, storage, message delivery + maintenance
 - `src/cli/handlers/session-init.ts` — UserPromptSubmit hook: session creation, prompt storage
 - `src/cli/handlers/summarize.ts` — Stop hook: assistant response extraction
-- `src/services/sqlite/migrations/runner.ts` — Schema migrations (currently through #27)
+- `src/services/sqlite/migrations/runner.ts` — Schema migrations (currently through #28)
 - `src/utils/privacy.ts` — Auto-redaction patterns (8 categories)
 - `src/utils/message-rules.ts` — Auto-approve rule matching with mtime-based file caching
 - `src/cli/handlers/relevance.ts` — Relevance scoring heuristics
