@@ -704,6 +704,136 @@ function handleSendMessage(args: Record<string, any>): { content: Array<{ type: 
   return { content: [{ type: 'text' as const, text: parts.join('\n') }] };
 }
 
+function handleCheckInbox(args: Record<string, any>): { content: Array<{ type: 'text'; text: string }> } {
+  const from = args.from as string;
+  const statusFilter = (args.status as string | undefined) ?? null;
+  const limit = Math.min(Math.max((args.limit as number | undefined) ?? 10, 1), 50);
+
+  if (!from) {
+    return { content: [{ type: 'text' as const, text: 'Error: "from" (your project name) is required.' }] };
+  }
+
+  const validStatuses = ['pending_approval', 'approved', 'delivered', 'completed', 'rejected', 'expired'];
+  if (statusFilter && !validStatuses.includes(statusFilter)) {
+    return { content: [{ type: 'text' as const, text: `Error: status must be one of: ${validStatuses.join(', ')}` }] };
+  }
+
+  let query: string;
+  let params: any[];
+
+  if (statusFilter) {
+    query = `
+      SELECT id, source_project, target_project, message_type, priority, subject, body,
+             status, created_at_epoch, delivered_at_epoch, completed_at_epoch, response_body, parent_message_id
+      FROM inter_session_messages
+      WHERE (target_project = ? OR source_project = ?) AND status = ?
+      ORDER BY created_at_epoch DESC
+      LIMIT ?
+    `;
+    params = [from, from, statusFilter, limit];
+  } else {
+    query = `
+      SELECT id, source_project, target_project, message_type, priority, subject, body,
+             status, created_at_epoch, delivered_at_epoch, completed_at_epoch, response_body, parent_message_id
+      FROM inter_session_messages
+      WHERE (target_project = ? OR source_project = ?) AND status NOT IN ('expired')
+      ORDER BY created_at_epoch DESC
+      LIMIT ?
+    `;
+    params = [from, from, limit];
+  }
+
+  const messages = cachedPrepare(query).all(...params) as Array<{
+    id: number; source_project: string; target_project: string; message_type: string;
+    priority: string; subject: string | null; body: string; status: string;
+    created_at_epoch: number; delivered_at_epoch: number | null; completed_at_epoch: number | null;
+    response_body: string | null; parent_message_id: number | null;
+  }>;
+
+  if (messages.length === 0) {
+    return { content: [{ type: 'text' as const, text: `No messages found for project "${from}"${statusFilter ? ` with status "${statusFilter}"` : ''}.` }] };
+  }
+
+  const lines: string[] = [`## Inbox for ${from} (${messages.length} message${messages.length !== 1 ? 's' : ''})`, ''];
+
+  for (const msg of messages) {
+    const direction = msg.target_project === from ? 'INCOMING' : 'OUTGOING';
+    const peer = direction === 'INCOMING' ? msg.source_project : msg.target_project;
+    const created = new Date(msg.created_at_epoch * 1000).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+
+    lines.push(`### #${msg.id} [${direction}] ${msg.status.toUpperCase()}`);
+    lines.push(`- **${direction === 'INCOMING' ? 'From' : 'To'}:** ${peer} | **Type:** ${msg.message_type} | **Priority:** ${msg.priority}`);
+    if (msg.subject) lines.push(`- **Subject:** ${msg.subject}`);
+    if (msg.parent_message_id) lines.push(`- **Thread:** reply to #${msg.parent_message_id}`);
+    lines.push(`- **Created:** ${created}`);
+    lines.push(`- **Body:** ${msg.body.length > 200 ? msg.body.slice(0, 200) + '...' : msg.body}`);
+    if (msg.response_body) {
+      lines.push(`- **Response:** ${msg.response_body.length > 200 ? msg.response_body.slice(0, 200) + '...' : msg.response_body}`);
+    }
+    if (msg.status === 'delivered' && direction === 'INCOMING') {
+      lines.push(`- **Action:** reply_message(message_id=${msg.id}, response="...", from="${from}")`);
+    }
+    lines.push('');
+  }
+
+  return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+}
+
+function handleReplyMessage(args: Record<string, any>): { content: Array<{ type: 'text'; text: string }> } {
+  const messageId = args.message_id as number;
+  const response = args.response as string;
+  const from = args.from as string;
+
+  if (!messageId || !response || !from) {
+    return { content: [{ type: 'text' as const, text: 'Error: "message_id", "response", and "from" (your project name) are required.' }] };
+  }
+
+  const msg = cachedPrepare(
+    'SELECT id, target_project, source_project, status, subject FROM inter_session_messages WHERE id = ?'
+  ).get(messageId) as { id: number; target_project: string; source_project: string; status: string; subject: string | null } | null;
+
+  if (!msg) {
+    return { content: [{ type: 'text' as const, text: `Error: message #${messageId} not found.` }] };
+  }
+
+  if (msg.target_project !== from) {
+    return { content: [{ type: 'text' as const, text: `Error: message #${messageId} was sent to "${msg.target_project}", not "${from}". You can only reply to messages addressed to your project.` }] };
+  }
+
+  if (msg.status !== 'delivered') {
+    return { content: [{ type: 'text' as const, text: `Error: message #${messageId} has status "${msg.status}". Only delivered messages can be replied to.` }] };
+  }
+
+  const nowEpoch = Math.floor(Date.now() / 1000);
+
+  cachedPrepare(
+    `UPDATE inter_session_messages SET status = 'completed', completed_at_epoch = ?, response_body = ? WHERE id = ?`
+  ).run(nowEpoch, response, messageId);
+
+  // Insert a reply message back to the source project so they see it in their inbox
+  const session = cachedPrepare(
+    "SELECT content_session_id FROM sdk_sessions WHERE project = ? ORDER BY started_at_epoch DESC LIMIT 1"
+  ).get(from) as { content_session_id: string } | null;
+  const sourceSessionId = session?.content_session_id ?? 'unknown';
+
+  const replyResult = cachedPrepare(`
+    INSERT INTO inter_session_messages (
+      source_project, source_session_id, target_project,
+      message_type, priority, subject, body, parent_message_id,
+      status, created_at_epoch, ttl_seconds
+    ) VALUES (?, ?, ?, 'reply', 'normal', ?, ?, ?, 'pending_approval', ?, 86400)
+  `).run(from, sourceSessionId, msg.source_project, msg.subject ? `Re: ${msg.subject}` : null, response, messageId, nowEpoch);
+
+  const replyId = Number(replyResult.lastInsertRowid);
+
+  const parts = [
+    `Message #${messageId} marked as **completed** with your response.`,
+    `Reply message #${replyId} sent back to **${msg.source_project}** (pending approval).`,
+  ];
+
+  return { content: [{ type: 'text' as const, text: parts.join('\n') }] };
+}
+
 /**
  * Tool definitions
  */
@@ -824,6 +954,36 @@ Prefix R: = raw observations, L: = legacy observations, C: = consolidated sessio
       additionalProperties: false
     },
     handler: async (args: any) => handleSendMessage(args)
+  },
+  {
+    name: 'check_inbox',
+    description: 'Check your inter-session message inbox. Shows incoming messages (sent to your project) and outgoing messages (sent from your project). Use to see pending, delivered, or completed messages.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: 'Your current project name — used to identify which messages are incoming vs outgoing' },
+        status: { type: 'string', enum: ['pending_approval', 'approved', 'delivered', 'completed', 'rejected', 'expired'], description: 'Filter by message status. Omit to see all non-expired messages.' },
+        limit: { type: 'number', description: 'Max results (default 10, max 50)' }
+      },
+      required: ['from'],
+      additionalProperties: false
+    },
+    handler: async (args: any) => handleCheckInbox(args)
+  },
+  {
+    name: 'reply_message',
+    description: 'Reply to a delivered inter-session message. Marks the original message as completed and sends a reply back to the source project (pending operator approval).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'number', description: 'ID of the delivered message to reply to' },
+        response: { type: 'string', description: 'Your response body' },
+        from: { type: 'string', description: 'Your current project name — must match the target_project of the message' }
+      },
+      required: ['message_id', 'response', 'from'],
+      additionalProperties: false
+    },
+    handler: async (args: any) => handleReplyMessage(args)
   },
   {
     name: 'forget',

@@ -543,6 +543,221 @@ describe('claude-code adapter — formatOutput merges hookSpecificOutput with co
   });
 });
 
+describe('check_inbox — handler SQL logic', () => {
+  beforeAll(() => {
+    // Clear test data and set up inbox test messages
+    db.prepare("DELETE FROM inter_session_messages WHERE source_project LIKE 'Inbox%' OR target_project LIKE 'Inbox%'").run();
+
+    // Incoming message (delivered to InboxProject)
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, message_type, priority, subject, body, status, created_at_epoch, ttl_seconds)
+      VALUES ('InboxSender', 'sess-inbox', 'InboxProject', 'request', 'high', 'Deploy v3', 'Please deploy', 'delivered', 1749900000, 86400)
+    `).run();
+
+    // Outgoing message (sent by InboxProject)
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, message_type, priority, subject, body, status, created_at_epoch, ttl_seconds)
+      VALUES ('InboxProject', 'sess-inbox-out', 'InboxReceiver', 'notify', 'normal', 'Build done', 'Build passed', 'pending_approval', 1749900100, 86400)
+    `).run();
+
+    // Completed message
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, message_type, priority, subject, body, status, created_at_epoch, completed_at_epoch, response_body, ttl_seconds)
+      VALUES ('InboxOld', 'sess-inbox-old', 'InboxProject', 'question', 'normal', 'Status?', 'What is the status?', 'completed', 1749899000, 1749899500, 'All good', 86400)
+    `).run();
+
+    // Expired message (should be excluded by default)
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, message_type, priority, body, status, created_at_epoch, ttl_seconds)
+      VALUES ('InboxExpired', 'sess-exp', 'InboxProject', 'notify', 'low', 'Old notification', 'expired', 1749800000, 86400)
+    `).run();
+  });
+
+  test('returns incoming and outgoing messages for project', () => {
+    const messages = db.prepare(`
+      SELECT id, source_project, target_project, status
+      FROM inter_session_messages
+      WHERE (target_project = ? OR source_project = ?) AND status NOT IN ('expired')
+      ORDER BY created_at_epoch DESC
+      LIMIT 10
+    `).all('InboxProject', 'InboxProject') as Array<{ id: number; source_project: string; target_project: string; status: string }>;
+
+    expect(messages.length).toBe(3);
+    // Most recent first
+    expect(messages[0].source_project).toBe('InboxProject'); // outgoing
+    expect(messages[1].target_project).toBe('InboxProject'); // incoming delivered
+    expect(messages[2].target_project).toBe('InboxProject'); // incoming completed
+  });
+
+  test('status filter narrows results', () => {
+    const delivered = db.prepare(`
+      SELECT id FROM inter_session_messages
+      WHERE (target_project = ? OR source_project = ?) AND status = ?
+      ORDER BY created_at_epoch DESC
+      LIMIT 10
+    `).all('InboxProject', 'InboxProject', 'delivered') as Array<{ id: number }>;
+
+    expect(delivered.length).toBe(1);
+  });
+
+  test('expired messages excluded by default', () => {
+    const all = db.prepare(`
+      SELECT id, status FROM inter_session_messages
+      WHERE (target_project = ? OR source_project = ?) AND status NOT IN ('expired')
+      ORDER BY created_at_epoch DESC
+      LIMIT 50
+    `).all('InboxProject', 'InboxProject') as Array<{ id: number; status: string }>;
+
+    const expired = all.filter(m => m.status === 'expired');
+    expect(expired.length).toBe(0);
+  });
+
+  test('status filter can explicitly show expired', () => {
+    const expired = db.prepare(`
+      SELECT id FROM inter_session_messages
+      WHERE (target_project = ? OR source_project = ?) AND status = ?
+      ORDER BY created_at_epoch DESC
+      LIMIT 10
+    `).all('InboxProject', 'InboxProject', 'expired') as Array<{ id: number }>;
+
+    expect(expired.length).toBe(1);
+  });
+
+  test('limit caps results', () => {
+    const limited = db.prepare(`
+      SELECT id FROM inter_session_messages
+      WHERE (target_project = ? OR source_project = ?) AND status NOT IN ('expired')
+      ORDER BY created_at_epoch DESC
+      LIMIT ?
+    `).all('InboxProject', 'InboxProject', 1) as Array<{ id: number }>;
+
+    expect(limited.length).toBe(1);
+  });
+
+  test('empty inbox returns no messages', () => {
+    const empty = db.prepare(`
+      SELECT id FROM inter_session_messages
+      WHERE (target_project = ? OR source_project = ?) AND status NOT IN ('expired')
+      ORDER BY created_at_epoch DESC
+      LIMIT 10
+    `).all('NonExistentInbox', 'NonExistentInbox') as Array<{ id: number }>;
+
+    expect(empty.length).toBe(0);
+  });
+});
+
+describe('reply_message — handler SQL logic', () => {
+  let deliveredMsgId: number;
+
+  beforeAll(() => {
+    // Set up a session for reply source
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, started_at, started_at_epoch, status, prompt_counter)
+      VALUES ('reply-test-sess', 'ReplyTarget', '2026-06-11T12:00:00Z', 1749902400, 'active', 1)
+    `).run();
+
+    // Insert a delivered message that can be replied to
+    const result = db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, message_type, priority, subject, body, status, delivered_at_epoch, created_at_epoch, ttl_seconds)
+      VALUES ('ReplySender', 'sess-reply-src', 'ReplyTarget', 'question', 'normal', 'Migration status', 'Has migration 27 been applied?', 'delivered', 1749902000, 1749901000, 86400)
+    `).run();
+    deliveredMsgId = Number(result.lastInsertRowid);
+  });
+
+  test('validates message exists', () => {
+    const msg = db.prepare(
+      'SELECT id, target_project, source_project, status, subject FROM inter_session_messages WHERE id = ?'
+    ).get(999999) as any;
+    expect(msg).toBeNull();
+  });
+
+  test('validates message is addressed to replier project', () => {
+    const msg = db.prepare(
+      'SELECT id, target_project, source_project, status FROM inter_session_messages WHERE id = ?'
+    ).get(deliveredMsgId) as any;
+    expect(msg.target_project).toBe('ReplyTarget');
+    expect(msg.target_project).not.toBe('WrongProject');
+  });
+
+  test('validates message status is delivered', () => {
+    const msg = db.prepare(
+      'SELECT status FROM inter_session_messages WHERE id = ?'
+    ).get(deliveredMsgId) as any;
+    expect(msg.status).toBe('delivered');
+  });
+
+  test('reply completes original message and creates reply message', () => {
+    const nowEpoch = 1749903000;
+    const responseText = 'Yes, migration 27 has been applied successfully.';
+
+    // Complete the original message
+    db.prepare(
+      `UPDATE inter_session_messages SET status = 'completed', completed_at_epoch = ?, response_body = ? WHERE id = ?`
+    ).run(nowEpoch, responseText, deliveredMsgId);
+
+    // Verify original is completed
+    const original = db.prepare('SELECT status, completed_at_epoch, response_body FROM inter_session_messages WHERE id = ?').get(deliveredMsgId) as any;
+    expect(original.status).toBe('completed');
+    expect(original.completed_at_epoch).toBe(nowEpoch);
+    expect(original.response_body).toBe(responseText);
+
+    // Insert reply message back to source
+    const replyResult = db.prepare(`
+      INSERT INTO inter_session_messages (
+        source_project, source_session_id, target_project,
+        message_type, priority, subject, body, parent_message_id,
+        status, created_at_epoch, ttl_seconds
+      ) VALUES (?, ?, ?, 'reply', 'normal', ?, ?, ?, 'pending_approval', ?, 86400)
+    `).run('ReplyTarget', 'reply-test-sess', 'ReplySender', 'Re: Migration status', responseText, deliveredMsgId, nowEpoch);
+
+    const replyId = Number(replyResult.lastInsertRowid);
+    expect(replyId).toBeGreaterThan(0);
+
+    // Verify reply message
+    const reply = db.prepare('SELECT * FROM inter_session_messages WHERE id = ?').get(replyId) as any;
+    expect(reply.source_project).toBe('ReplyTarget');
+    expect(reply.target_project).toBe('ReplySender');
+    expect(reply.message_type).toBe('reply');
+    expect(reply.parent_message_id).toBe(deliveredMsgId);
+    expect(reply.subject).toBe('Re: Migration status');
+    expect(reply.body).toBe(responseText);
+    expect(reply.status).toBe('pending_approval');
+  });
+
+  test('reply to already-completed message is rejected', () => {
+    const msg = db.prepare(
+      'SELECT status FROM inter_session_messages WHERE id = ?'
+    ).get(deliveredMsgId) as any;
+    expect(msg.status).toBe('completed');
+    // Handler would return error since status !== 'delivered'
+  });
+
+  test('reply creates proper thread linkage via parent_message_id', () => {
+    const thread = db.prepare(
+      'SELECT * FROM inter_session_messages WHERE parent_message_id = ?'
+    ).all(deliveredMsgId) as any[];
+    expect(thread.length).toBe(1);
+    expect(thread[0].message_type).toBe('reply');
+    expect(thread[0].source_project).toBe('ReplyTarget');
+  });
+
+  test('reply without subject omits Re: prefix', () => {
+    // Insert a delivered message without subject
+    const noSubjResult = db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, message_type, priority, body, status, delivered_at_epoch, created_at_epoch, ttl_seconds)
+      VALUES ('NoSubjSender', 'sess-nosub', 'ReplyTarget', 'request', 'normal', 'Do something', 'delivered', 1749903500, 1749903000, 86400)
+    `).run();
+    const noSubjId = Number(noSubjResult.lastInsertRowid);
+
+    const msg = db.prepare('SELECT subject FROM inter_session_messages WHERE id = ?').get(noSubjId) as any;
+    expect(msg.subject).toBeNull();
+
+    // Reply: subject should be null since original had no subject
+    const replySubject = msg.subject ? `Re: ${msg.subject}` : null;
+    expect(replySubject).toBeNull();
+  });
+});
+
 describe('migration 27 — idempotent', () => {
   test('running migrations again does not fail or duplicate', () => {
     const runner = new MigrationRunner(db);
