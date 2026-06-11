@@ -28,6 +28,7 @@ import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js'
 import { openDatabase } from '../../services/sqlite/DirectDB.js';
 import { getProjectContext } from '../../utils/project-name.js';
 import { logger } from '../../utils/logger.js';
+import { ensureSidecarRunning, type SidecarInfo } from './sidecar.js';
 
 /** Compact summary budget (fallback mode): ~2000 tokens */
 const MAX_SUMMARY_CHARS = 8000;
@@ -469,6 +470,10 @@ function ensureClaudeMdInstructions(): void {
 
 // ─── Main handler ───────────────────────────────────────────────────────
 
+function formatSidecarBanner(sidecar: SidecarInfo): string {
+  return `\n---\n## claude-recall Pro Dashboard\n📊 **${sidecar.url}**\nOpen the link above to access the real-time dashboard, session explorer, and export tools.\n`;
+}
+
 export const contextHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
     ensureClaudeMdInstructions();
@@ -477,22 +482,16 @@ export const contextHandler: EventHandler = {
     const context = getProjectContext(cwd);
     const db = openDatabase();
 
+    let additionalContext = '';
+
     try {
       const projects = context.allProjects;
 
       if (RECOVERY_MODE === 'off') {
         logger.debug('HOOK', 'Recovery mode disabled via CLAUDE_RECALL_RECOVERY_MODE=off');
-        return {
-          hookSpecificOutput: {
-            hookEventName: 'SessionStart',
-            additionalContext: RECALL_USAGE_FOOTER.trim()
-          }
-        };
-      }
-
-      // ─── RECOVERY MODE ───
-      // If there's recent activity within the window, dump it in full fidelity.
-      if (RECOVERY_MODE === 'full') {
+        additionalContext = RECALL_USAGE_FOOTER.trim();
+      } else if (RECOVERY_MODE === 'full') {
+        // ─── RECOVERY MODE ───
         const recoveryContext = buildRecoveryContext(db, projects);
         if (recoveryContext) {
           logger.debug('HOOK', 'Recovery mode active', {
@@ -500,69 +499,66 @@ export const contextHandler: EventHandler = {
             windowHours: RECOVERY_WINDOW_HOURS,
             budgetTokens: RECOVERY_BUDGET_TOKENS
           });
-          return {
-            hookSpecificOutput: {
-              hookEventName: 'SessionStart',
-              additionalContext: recoveryContext + RECALL_USAGE_FOOTER
-            }
-          };
+          additionalContext = recoveryContext + RECALL_USAGE_FOOTER;
         }
       }
 
       // ─── SUMMARY MODE (fallback) ───
-      // No recent activity — provide compact summary of best historical session.
-      const placeholders = projects.map(() => '?').join(',');
-      const sessions = db.prepare(
-        `SELECT content_session_id, project, status, prompt_counter, started_at, started_at_epoch
-         FROM sdk_sessions
-         WHERE project IN (${placeholders})
-         ORDER BY started_at_epoch DESC
-         LIMIT 5`
-      ).all(...projects) as SessionRow[];
+      if (!additionalContext) {
+        const placeholders = projects.map(() => '?').join(',');
+        const sessions = db.prepare(
+          `SELECT content_session_id, project, status, prompt_counter, started_at, started_at_epoch
+           FROM sdk_sessions
+           WHERE project IN (${placeholders})
+           ORDER BY started_at_epoch DESC
+           LIMIT 5`
+        ).all(...projects) as SessionRow[];
 
-      if (sessions.length === 0) {
-        return {
-          hookSpecificOutput: {
-            hookEventName: 'SessionStart',
-            additionalContext: ''
+        if (sessions.length > 0) {
+          const withPrompts = sessions.filter(s => s.prompt_counter > 0);
+          const bestSession = withPrompts.length > 0
+            ? withPrompts.reduce((a, b) => a.prompt_counter >= b.prompt_counter ? a : b)
+            : sessions[0];
+          additionalContext = bestSession.prompt_counter > 0
+            ? buildCompactSummary(db, bestSession)
+            : '';
+
+          if (additionalContext.length < MAX_SUMMARY_CHARS - 500) {
+            const consolidated = getConsolidatedContext(db, projects, additionalContext.length);
+            if (consolidated) {
+              additionalContext += '\n\n' + consolidated;
+            }
           }
-        };
-      }
 
-      // Pick most substantial recent session
-      const withPrompts = sessions.filter(s => s.prompt_counter > 0);
-      const bestSession = withPrompts.length > 0
-        ? withPrompts.reduce((a, b) => a.prompt_counter >= b.prompt_counter ? a : b)
-        : sessions[0];
-      let additionalContext = bestSession.prompt_counter > 0
-        ? buildCompactSummary(db, bestSession)
-        : '';
+          if (additionalContext) {
+            additionalContext += RECALL_USAGE_FOOTER;
+          }
 
-      // Append consolidated session summaries if budget allows
-      if (additionalContext.length < MAX_SUMMARY_CHARS - 500) {
-        const consolidated = getConsolidatedContext(db, projects, additionalContext.length);
-        if (consolidated) {
-          additionalContext += '\n\n' + consolidated;
+          logger.debug('HOOK', 'Summary mode (no recent activity)', {
+            sessions: sessions.length,
+            contextLength: additionalContext.length
+          });
         }
       }
-
-      if (additionalContext) {
-        additionalContext += RECALL_USAGE_FOOTER;
-      }
-
-      logger.debug('HOOK', 'Summary mode (no recent activity)', {
-        sessions: sessions.length,
-        contextLength: additionalContext.length
-      });
-
-      return {
-        hookSpecificOutput: {
-          hookEventName: 'SessionStart',
-          additionalContext
-        }
-      };
     } finally {
       db.close();
     }
+
+    // ─── SIDECAR: auto-spawn pro binary if installed ───
+    try {
+      const sidecar = await ensureSidecarRunning();
+      if (sidecar) {
+        additionalContext += formatSidecarBanner(sidecar);
+      }
+    } catch (err) {
+      logger.debug('SIDECAR', 'Sidecar check failed (non-fatal)', { error: String(err) });
+    }
+
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'SessionStart',
+        additionalContext
+      }
+    };
   }
 };

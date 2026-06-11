@@ -98,8 +98,8 @@ function getPlatformAdapter(platform2) {
 }
 
 // src/cli/handlers/context.ts
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
-import { join as join4 } from "path";
+import { readFileSync as readFileSync4, writeFileSync as writeFileSync3, mkdirSync as mkdirSync4, existsSync as existsSync5 } from "fs";
+import { join as join5 } from "path";
 import { homedir as homedir4 } from "os";
 
 // src/services/sqlite/DirectDB.ts
@@ -1192,6 +1192,112 @@ function getProjectContext(cwd) {
   return { primary, allProjects: [primary] };
 }
 
+// src/cli/handlers/sidecar.ts
+import { spawn } from "child_process";
+import { existsSync as existsSync4, readFileSync as readFileSync3, writeFileSync as writeFileSync2, unlinkSync } from "fs";
+import { join as join4 } from "path";
+import { randomBytes } from "crypto";
+var BIN_DIR = join4(DATA_DIR, "bin");
+var STATE_FILE = join4(DATA_DIR, "pro.state");
+var DEFAULT_PORT = 37778;
+var BINARY_NAME = process.platform === "win32" ? "claude-recall-pro.exe" : "claude-recall-pro";
+var BINARY_PATH = process.env.CLAUDE_RECALL_PRO_BINARY || join4(BIN_DIR, BINARY_NAME);
+var HEALTH_TIMEOUT_MS = 2e3;
+var READY_WAIT_MS = 3e3;
+var READY_POLL_MS = 300;
+function readState() {
+  try {
+    if (!existsSync4(STATE_FILE)) return null;
+    return JSON.parse(readFileSync3(STATE_FILE, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+function writeState(state) {
+  writeFileSync2(STATE_FILE, JSON.stringify(state, null, 2));
+}
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function isHealthy(port, token) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+    const resp = await fetch(`http://127.0.0.1:${port}/api/health?token=${token}`, {
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+async function waitForReady(port, token) {
+  const deadline = Date.now() + READY_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (await isHealthy(port, token)) return true;
+    await new Promise((r) => setTimeout(r, READY_POLL_MS));
+  }
+  return false;
+}
+async function ensureSidecarRunning() {
+  if ((process.env.CLAUDE_RECALL_PRO_SIDECAR ?? "").toLowerCase() === "off") {
+    return null;
+  }
+  if (!existsSync4(BINARY_PATH)) {
+    logger.debug("SIDECAR", "Pro binary not found", { path: BINARY_PATH });
+    return null;
+  }
+  const port = parseInt(process.env.CLAUDE_RECALL_UI_PORT || String(DEFAULT_PORT), 10);
+  const state = readState();
+  if (state && isProcessAlive(state.pid)) {
+    if (await isHealthy(state.port, state.token)) {
+      logger.debug("SIDECAR", "Pro already running", { pid: state.pid, port: state.port });
+      return {
+        url: `http://127.0.0.1:${state.port}?token=${state.token}`,
+        token: state.token,
+        pid: state.pid,
+        port: state.port
+      };
+    }
+    logger.debug("SIDECAR", "Stale sidecar \u2014 PID alive but not healthy, respawning", { pid: state.pid });
+  }
+  const token = randomBytes(24).toString("hex");
+  try {
+    const child = spawn(BINARY_PATH, [], {
+      detached: true,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        CLAUDE_RECALL_UI_TOKEN: token,
+        CLAUDE_RECALL_UI_PORT: String(port)
+      }
+    });
+    child.unref();
+    const pid = child.pid;
+    if (!pid) {
+      logger.warn("SIDECAR", "Failed to spawn pro binary \u2014 no PID");
+      return null;
+    }
+    writeState({ pid, port, token, startedAt: (/* @__PURE__ */ new Date()).toISOString() });
+    const ready = await waitForReady(port, token);
+    if (!ready) {
+      logger.warn("SIDECAR", "Pro binary spawned but not responding yet", { pid, port });
+    }
+    const url = `http://127.0.0.1:${port}?token=${token}`;
+    logger.debug("SIDECAR", `Pro sidecar launched \u2192 ${url}`, { pid, port });
+    return { url, token, pid, port };
+  } catch (err) {
+    logger.warn("SIDECAR", "Failed to spawn pro binary", { error: String(err) });
+    return null;
+  }
+}
+
 // src/cli/handlers/context.ts
 var MAX_SUMMARY_CHARS = 8e3;
 var RECOVERY_MODE = (process.env.CLAUDE_RECALL_RECOVERY_MODE ?? "full").toLowerCase();
@@ -1526,19 +1632,27 @@ You have access to claude-recall MCP tools for searching past conversation histo
 <!-- end-claude-recall-instructions -->`;
 function ensureClaudeMdInstructions() {
   try {
-    const claudeMdPath = join4(homedir4(), ".claude", "CLAUDE.md");
-    const claudeDir = join4(homedir4(), ".claude");
-    if (!existsSync4(claudeDir)) {
+    const claudeMdPath = join5(homedir4(), ".claude", "CLAUDE.md");
+    const claudeDir = join5(homedir4(), ".claude");
+    if (!existsSync5(claudeDir)) {
       mkdirSync4(claudeDir, { recursive: true });
     }
-    if (existsSync4(claudeMdPath)) {
-      const content = readFileSync3(claudeMdPath, "utf-8");
+    if (existsSync5(claudeMdPath)) {
+      const content = readFileSync4(claudeMdPath, "utf-8");
       if (content.includes(CLAUDE_MD_MARKER)) return;
     }
-    writeFileSync2(claudeMdPath, (existsSync4(claudeMdPath) ? readFileSync3(claudeMdPath, "utf-8") : "") + CLAUDE_MD_BLOCK, "utf-8");
+    writeFileSync3(claudeMdPath, (existsSync5(claudeMdPath) ? readFileSync4(claudeMdPath, "utf-8") : "") + CLAUDE_MD_BLOCK, "utf-8");
     logger.debug("HOOK", "Injected recall instructions into ~/.claude/CLAUDE.md");
   } catch {
   }
+}
+function formatSidecarBanner(sidecar) {
+  return `
+---
+## claude-recall Pro Dashboard
+\u{1F4CA} **${sidecar.url}**
+Open the link above to access the real-time dashboard, session explorer, and export tools.
+`;
 }
 var contextHandler = {
   async execute(input) {
@@ -1546,18 +1660,13 @@ var contextHandler = {
     const cwd = input.cwd ?? process.cwd();
     const context = getProjectContext(cwd);
     const db = openDatabase();
+    let additionalContext = "";
     try {
       const projects = context.allProjects;
       if (RECOVERY_MODE === "off") {
         logger.debug("HOOK", "Recovery mode disabled via CLAUDE_RECALL_RECOVERY_MODE=off");
-        return {
-          hookSpecificOutput: {
-            hookEventName: "SessionStart",
-            additionalContext: RECALL_USAGE_FOOTER.trim()
-          }
-        };
-      }
-      if (RECOVERY_MODE === "full") {
+        additionalContext = RECALL_USAGE_FOOTER.trim();
+      } else if (RECOVERY_MODE === "full") {
         const recoveryContext = buildRecoveryContext(db, projects);
         if (recoveryContext) {
           logger.debug("HOOK", "Recovery mode active", {
@@ -1565,55 +1674,54 @@ var contextHandler = {
             windowHours: RECOVERY_WINDOW_HOURS,
             budgetTokens: RECOVERY_BUDGET_TOKENS
           });
-          return {
-            hookSpecificOutput: {
-              hookEventName: "SessionStart",
-              additionalContext: recoveryContext + RECALL_USAGE_FOOTER
+          additionalContext = recoveryContext + RECALL_USAGE_FOOTER;
+        }
+      }
+      if (!additionalContext) {
+        const placeholders = projects.map(() => "?").join(",");
+        const sessions = db.prepare(
+          `SELECT content_session_id, project, status, prompt_counter, started_at, started_at_epoch
+           FROM sdk_sessions
+           WHERE project IN (${placeholders})
+           ORDER BY started_at_epoch DESC
+           LIMIT 5`
+        ).all(...projects);
+        if (sessions.length > 0) {
+          const withPrompts = sessions.filter((s) => s.prompt_counter > 0);
+          const bestSession = withPrompts.length > 0 ? withPrompts.reduce((a, b) => a.prompt_counter >= b.prompt_counter ? a : b) : sessions[0];
+          additionalContext = bestSession.prompt_counter > 0 ? buildCompactSummary(db, bestSession) : "";
+          if (additionalContext.length < MAX_SUMMARY_CHARS - 500) {
+            const consolidated = getConsolidatedContext(db, projects, additionalContext.length);
+            if (consolidated) {
+              additionalContext += "\n\n" + consolidated;
             }
-          };
-        }
-      }
-      const placeholders = projects.map(() => "?").join(",");
-      const sessions = db.prepare(
-        `SELECT content_session_id, project, status, prompt_counter, started_at, started_at_epoch
-         FROM sdk_sessions
-         WHERE project IN (${placeholders})
-         ORDER BY started_at_epoch DESC
-         LIMIT 5`
-      ).all(...projects);
-      if (sessions.length === 0) {
-        return {
-          hookSpecificOutput: {
-            hookEventName: "SessionStart",
-            additionalContext: ""
           }
-        };
-      }
-      const withPrompts = sessions.filter((s) => s.prompt_counter > 0);
-      const bestSession = withPrompts.length > 0 ? withPrompts.reduce((a, b) => a.prompt_counter >= b.prompt_counter ? a : b) : sessions[0];
-      let additionalContext = bestSession.prompt_counter > 0 ? buildCompactSummary(db, bestSession) : "";
-      if (additionalContext.length < MAX_SUMMARY_CHARS - 500) {
-        const consolidated = getConsolidatedContext(db, projects, additionalContext.length);
-        if (consolidated) {
-          additionalContext += "\n\n" + consolidated;
+          if (additionalContext) {
+            additionalContext += RECALL_USAGE_FOOTER;
+          }
+          logger.debug("HOOK", "Summary mode (no recent activity)", {
+            sessions: sessions.length,
+            contextLength: additionalContext.length
+          });
         }
       }
-      if (additionalContext) {
-        additionalContext += RECALL_USAGE_FOOTER;
-      }
-      logger.debug("HOOK", "Summary mode (no recent activity)", {
-        sessions: sessions.length,
-        contextLength: additionalContext.length
-      });
-      return {
-        hookSpecificOutput: {
-          hookEventName: "SessionStart",
-          additionalContext
-        }
-      };
     } finally {
       db.close();
     }
+    try {
+      const sidecar = await ensureSidecarRunning();
+      if (sidecar) {
+        additionalContext += formatSidecarBanner(sidecar);
+      }
+    } catch (err) {
+      logger.debug("SIDECAR", "Sidecar check failed (non-fatal)", { error: String(err) });
+    }
+    return {
+      hookSpecificOutput: {
+        hookEventName: "SessionStart",
+        additionalContext
+      }
+    };
   }
 };
 
@@ -1695,7 +1803,7 @@ var sessionInitHandler = {
 };
 
 // src/cli/handlers/observation.ts
-import { readFileSync as readFileSync4 } from "fs";
+import { readFileSync as readFileSync5 } from "fs";
 
 // src/cli/handlers/relevance.ts
 var LOW_SIGNAL_FILES = /* @__PURE__ */ new Set([
@@ -1963,7 +2071,7 @@ function extractText(content) {
 function captureTranscript(db, sessionId, project, cwd, transcriptPath, nowEpoch) {
   let data;
   try {
-    data = readFileSync4(transcriptPath, "utf-8");
+    data = readFileSync5(transcriptPath, "utf-8");
   } catch {
     return;
   }
@@ -2096,7 +2204,7 @@ var observationHandler = {
 };
 
 // src/cli/handlers/summarize.ts
-import { readFileSync as readFileSync5 } from "fs";
+import { readFileSync as readFileSync6 } from "fs";
 var MAX_RESPONSE_CHARS = 1e4;
 function extractText2(content) {
   if (typeof content === "string") return content;
@@ -2113,7 +2221,7 @@ var summarizeHandler = {
     }
     let transcriptData;
     try {
-      transcriptData = readFileSync5(transcriptPath, "utf-8");
+      transcriptData = readFileSync6(transcriptPath, "utf-8");
     } catch (err) {
       logger.debug("HOOK", `Could not read transcript: ${err}`);
       return { continue: true, suppressOutput: true };
@@ -2179,7 +2287,7 @@ import { basename as basename2 } from "path";
 // src/shared/worker-utils.ts
 import path2 from "path";
 import { homedir as homedir5 } from "os";
-import { readFileSync as readFileSync6 } from "fs";
+import { readFileSync as readFileSync7 } from "fs";
 
 // src/shared/hook-constants.ts
 var HOOK_TIMEOUTS = {
@@ -2259,7 +2367,7 @@ async function isWorkerHealthy() {
 }
 function getPluginVersion() {
   const packageJsonPath = path2.join(MARKETPLACE_ROOT, "package.json");
-  const packageJson = JSON.parse(readFileSync6(packageJsonPath, "utf-8"));
+  const packageJson = JSON.parse(readFileSync7(packageJsonPath, "utf-8"));
   return packageJson.version;
 }
 async function getWorkerVersion() {
