@@ -35,6 +35,7 @@ export class MigrationRunner {
     this.addRelevanceScoreColumn();
     this.addPrivacyColumns();
     this.createConsolidatedSessionsTable();
+    this.addModelAndUsageTracking();
   }
 
   /**
@@ -783,5 +784,49 @@ export class MigrationRunner {
 
     logger.debug('DB', 'consolidated_sessions table created');
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(24, new Date().toISOString());
+  }
+
+  /**
+   * Add model column to raw_observations and create api_usage table (migration 25)
+   *
+   * model: extracted from transcript's message.model (e.g. "claude-opus-4-6")
+   * api_usage: per-turn aggregation of token counts, cache stats, and estimated cost
+   */
+  private addModelAndUsageTracking(): void {
+    const applied = this.db.prepare('SELECT 1 FROM schema_versions WHERE version = 25').get();
+    if (applied) return;
+
+    const obsCols = this.db.prepare('PRAGMA table_info(raw_observations)').all() as TableColumnInfo[];
+    if (!obsCols.some(c => c.name === 'model')) {
+      this.db.run('ALTER TABLE raw_observations ADD COLUMN model TEXT');
+      logger.debug('DB', 'Added model column to raw_observations');
+    }
+
+    const tables = this.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='api_usage'").all() as TableNameRow[];
+    if (tables.length === 0) {
+      this.db.run(`
+        CREATE TABLE api_usage (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          content_session_id TEXT NOT NULL,
+          prompt_number INTEGER NOT NULL,
+          model TEXT,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          cache_creation_input_tokens INTEGER,
+          cache_read_input_tokens INTEGER,
+          cost_usd REAL,
+          service_tier TEXT,
+          created_at TEXT NOT NULL,
+          created_at_epoch INTEGER NOT NULL,
+          UNIQUE(content_session_id, prompt_number)
+        )
+      `);
+      this.db.run('CREATE INDEX idx_api_usage_session ON api_usage(content_session_id)');
+      this.db.run('CREATE INDEX idx_api_usage_epoch ON api_usage(created_at_epoch DESC)');
+      this.db.run('CREATE INDEX idx_api_usage_model ON api_usage(model)');
+      logger.debug('DB', 'Created api_usage table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(25, new Date().toISOString());
   }
 }

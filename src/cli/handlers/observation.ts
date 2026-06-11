@@ -15,6 +15,7 @@ import { readFileSync } from 'fs';
 import { computeRelevanceScore } from './relevance.js';
 import { redactSensitiveContent, containsSensitivePatterns } from '../../utils/privacy.js';
 import { consolidateOldSessions, applyTimeDecay, smartCleanup } from '../../services/consolidation.js';
+import { extractLatestUsage, estimateCostUsd } from '../../utils/transcript-usage.js';
 
 /** Max size for tool_response storage (50KB). Larger responses are truncated. */
 const MAX_RESPONSE_BYTES = 50_000;
@@ -187,11 +188,35 @@ export const observationHandler: EventHandler = {
         lastPromptText: lastPrompt?.prompt_text,
       });
 
+      // Extract model/usage from transcript (non-blocking — null if unavailable)
+      const usage = transcriptPath ? extractLatestUsage(transcriptPath) : null;
+      const model = usage?.model ?? null;
+
       db.run(
-        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, relevance_score, redacted)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [sessionId, project, toolName, inputStr, responseStr, cwd, promptNumber, now.toISOString(), nowEpoch, relevanceScore, redacted]
+        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, relevance_score, redacted, model)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, project, toolName, inputStr, responseStr, cwd, promptNumber, now.toISOString(), nowEpoch, relevanceScore, redacted, model]
       );
+
+      // Upsert per-turn usage into api_usage (deduped by session + prompt_number)
+      if (usage && promptNumber > 0) {
+        const costUsd = estimateCostUsd(usage);
+        db.run(
+          `INSERT INTO api_usage (content_session_id, prompt_number, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, cost_usd, service_tier, created_at, created_at_epoch)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(content_session_id, prompt_number) DO UPDATE SET
+             model = excluded.model,
+             input_tokens = excluded.input_tokens,
+             output_tokens = excluded.output_tokens,
+             cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+             cache_read_input_tokens = excluded.cache_read_input_tokens,
+             cost_usd = excluded.cost_usd,
+             service_tier = excluded.service_tier`,
+          [sessionId, promptNumber, usage.model, usage.inputTokens, usage.outputTokens,
+           usage.cacheCreationInputTokens, usage.cacheReadInputTokens, costUsd,
+           usage.serviceTier, now.toISOString(), nowEpoch]
+        );
+      }
 
       // Periodic transcript capture: every ~10 minutes, snapshot assistant responses
       // Check when we last captured for this session

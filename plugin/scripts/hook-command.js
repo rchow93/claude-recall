@@ -593,6 +593,7 @@ var MigrationRunner = class {
     this.addRelevanceScoreColumn();
     this.addPrivacyColumns();
     this.createConsolidatedSessionsTable();
+    this.addModelAndUsageTracking();
   }
   /**
    * Initialize database schema using migrations (migration004)
@@ -1154,6 +1155,46 @@ var MigrationRunner = class {
     this.db.run("CREATE INDEX IF NOT EXISTS idx_consolidated_epoch ON consolidated_sessions(original_started_at_epoch DESC)");
     logger.debug("DB", "consolidated_sessions table created");
     this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(24, (/* @__PURE__ */ new Date()).toISOString());
+  }
+  /**
+   * Add model column to raw_observations and create api_usage table (migration 25)
+   *
+   * model: extracted from transcript's message.model (e.g. "claude-opus-4-6")
+   * api_usage: per-turn aggregation of token counts, cache stats, and estimated cost
+   */
+  addModelAndUsageTracking() {
+    const applied = this.db.prepare("SELECT 1 FROM schema_versions WHERE version = 25").get();
+    if (applied) return;
+    const obsCols = this.db.prepare("PRAGMA table_info(raw_observations)").all();
+    if (!obsCols.some((c) => c.name === "model")) {
+      this.db.run("ALTER TABLE raw_observations ADD COLUMN model TEXT");
+      logger.debug("DB", "Added model column to raw_observations");
+    }
+    const tables = this.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='api_usage'").all();
+    if (tables.length === 0) {
+      this.db.run(`
+        CREATE TABLE api_usage (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          content_session_id TEXT NOT NULL,
+          prompt_number INTEGER NOT NULL,
+          model TEXT,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          cache_creation_input_tokens INTEGER,
+          cache_read_input_tokens INTEGER,
+          cost_usd REAL,
+          service_tier TEXT,
+          created_at TEXT NOT NULL,
+          created_at_epoch INTEGER NOT NULL,
+          UNIQUE(content_session_id, prompt_number)
+        )
+      `);
+      this.db.run("CREATE INDEX idx_api_usage_session ON api_usage(content_session_id)");
+      this.db.run("CREATE INDEX idx_api_usage_epoch ON api_usage(created_at_epoch DESC)");
+      this.db.run("CREATE INDEX idx_api_usage_model ON api_usage(model)");
+      logger.debug("DB", "Created api_usage table");
+    }
+    this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(25, (/* @__PURE__ */ new Date()).toISOString());
   }
 };
 
@@ -2042,6 +2083,70 @@ function smartCleanup(db, deleteCount) {
   }
 }
 
+// src/utils/transcript-usage.ts
+import { openSync, readSync, fstatSync, closeSync } from "fs";
+var TAIL_BYTES = 2e5;
+var MODEL_PRICING = {
+  "claude-opus-4-8": { inputPer1M: 15, outputPer1M: 75, cacheReadPer1M: 1.5, cacheWritePer1M: 18.75 },
+  "claude-opus-4-6": { inputPer1M: 15, outputPer1M: 75, cacheReadPer1M: 1.5, cacheWritePer1M: 18.75 },
+  "claude-sonnet-4-6": { inputPer1M: 3, outputPer1M: 15, cacheReadPer1M: 0.3, cacheWritePer1M: 3.75 },
+  "claude-haiku-4-5": { inputPer1M: 0.8, outputPer1M: 4, cacheReadPer1M: 0.08, cacheWritePer1M: 1 }
+};
+function estimateCostUsd(usage) {
+  const baseModel = Object.keys(MODEL_PRICING).find((k) => usage.model.startsWith(k));
+  const pricing = baseModel ? MODEL_PRICING[baseModel] : MODEL_PRICING["claude-sonnet-4-6"];
+  const inputCost = usage.inputTokens / 1e6 * pricing.inputPer1M;
+  const outputCost = usage.outputTokens / 1e6 * pricing.outputPer1M;
+  const cacheReadCost = usage.cacheReadInputTokens / 1e6 * pricing.cacheReadPer1M;
+  const cacheWriteCost = usage.cacheCreationInputTokens / 1e6 * pricing.cacheWritePer1M;
+  return inputCost + outputCost + cacheReadCost + cacheWriteCost;
+}
+function extractLatestUsage(transcriptPath) {
+  let fd;
+  try {
+    fd = openSync(transcriptPath, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const stat = fstatSync(fd);
+    const fileSize = stat.size;
+    if (fileSize === 0) return null;
+    const readStart = Math.max(0, fileSize - TAIL_BYTES);
+    const readLen = fileSize - readStart;
+    const buf = Buffer.alloc(readLen);
+    readSync(fd, buf, 0, readLen, readStart);
+    const tail = buf.toString("utf-8");
+    const lines = tail.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        const obj = JSON.parse(line);
+        const msg = obj.message;
+        if (!msg || msg.role !== "assistant") continue;
+        const model = msg.model;
+        const usage = msg.usage;
+        if (!model || !usage) continue;
+        if (model === "<synthetic>") continue;
+        return {
+          model,
+          inputTokens: usage.input_tokens ?? 0,
+          outputTokens: usage.output_tokens ?? 0,
+          cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
+          cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
+          serviceTier: usage.service_tier ?? null
+        };
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
 // src/cli/handlers/observation.ts
 var MAX_RESPONSE_BYTES = 5e4;
 var MAX_INPUT_BYTES = 5e4;
@@ -2164,11 +2269,41 @@ var observationHandler = {
         recentTools,
         lastPromptText: lastPrompt?.prompt_text
       });
+      const usage = transcriptPath ? extractLatestUsage(transcriptPath) : null;
+      const model = usage?.model ?? null;
       db.run(
-        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, relevance_score, redacted)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [sessionId, project, toolName, inputStr, responseStr, cwd, promptNumber, now.toISOString(), nowEpoch, relevanceScore, redacted]
+        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, relevance_score, redacted, model)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, project, toolName, inputStr, responseStr, cwd, promptNumber, now.toISOString(), nowEpoch, relevanceScore, redacted, model]
       );
+      if (usage && promptNumber > 0) {
+        const costUsd = estimateCostUsd(usage);
+        db.run(
+          `INSERT INTO api_usage (content_session_id, prompt_number, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, cost_usd, service_tier, created_at, created_at_epoch)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(content_session_id, prompt_number) DO UPDATE SET
+             model = excluded.model,
+             input_tokens = excluded.input_tokens,
+             output_tokens = excluded.output_tokens,
+             cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+             cache_read_input_tokens = excluded.cache_read_input_tokens,
+             cost_usd = excluded.cost_usd,
+             service_tier = excluded.service_tier`,
+          [
+            sessionId,
+            promptNumber,
+            usage.model,
+            usage.inputTokens,
+            usage.outputTokens,
+            usage.cacheCreationInputTokens,
+            usage.cacheReadInputTokens,
+            costUsd,
+            usage.serviceTier,
+            now.toISOString(),
+            nowEpoch
+          ]
+        );
+      }
       if (transcriptPath) {
         const lastCapture = db.prepare(
           `SELECT created_at_epoch FROM raw_observations
