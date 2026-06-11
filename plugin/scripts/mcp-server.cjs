@@ -21139,6 +21139,7 @@ var MigrationRunner = class {
     this.addPrivacyColumns();
     this.createConsolidatedSessionsTable();
     this.addModelAndUsageTracking();
+    this.addEncryptionColumns();
   }
   /**
    * Initialize database schema using migrations (migration004)
@@ -21741,6 +21742,32 @@ var MigrationRunner = class {
     }
     this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(25, (/* @__PURE__ */ new Date()).toISOString());
   }
+  /**
+   * Add encrypted flag to content tables (migration 26)
+   *
+   * Tracks which rows have AES-256-GCM encrypted content.
+   * Allows mixed encrypted/unencrypted data during gradual migration.
+   */
+  addEncryptionColumns() {
+    const applied = this.db.prepare("SELECT 1 FROM schema_versions WHERE version = 26").get();
+    if (applied) return;
+    const obsCols = this.db.prepare("PRAGMA table_info(raw_observations)").all();
+    if (!obsCols.some((c) => c.name === "encrypted")) {
+      this.db.run("ALTER TABLE raw_observations ADD COLUMN encrypted INTEGER DEFAULT 0");
+      logger.debug("DB", "Added encrypted column to raw_observations");
+    }
+    const promptCols = this.db.prepare("PRAGMA table_info(user_prompts)").all();
+    if (!promptCols.some((c) => c.name === "encrypted")) {
+      this.db.run("ALTER TABLE user_prompts ADD COLUMN encrypted INTEGER DEFAULT 0");
+      logger.debug("DB", "Added encrypted column to user_prompts");
+    }
+    const consCols = this.db.prepare("PRAGMA table_info(consolidated_sessions)").all();
+    if (!consCols.some((c) => c.name === "encrypted")) {
+      this.db.run("ALTER TABLE consolidated_sessions ADD COLUMN encrypted INTEGER DEFAULT 0");
+      logger.debug("DB", "Added encrypted column to consolidated_sessions");
+    }
+    this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(26, (/* @__PURE__ */ new Date()).toISOString());
+  }
 };
 
 // src/services/sqlite/DirectDB.ts
@@ -21807,6 +21834,85 @@ function midnightOffsetDays(offset) {
   return Math.floor(d.getTime() / 1e3);
 }
 
+// src/services/encryption.ts
+var import_crypto = require("crypto");
+var ALGORITHM = "aes-256-gcm";
+var IV_LENGTH = 12;
+var AUTH_TAG_LENGTH = 16;
+var ENCRYPTED_PREFIX = "$ENCRYPTED$";
+function decrypt(ciphertext, key) {
+  if (!ciphertext.startsWith(ENCRYPTED_PREFIX)) {
+    return ciphertext;
+  }
+  const packed = Buffer.from(ciphertext.slice(ENCRYPTED_PREFIX.length), "base64");
+  const iv = packed.subarray(0, IV_LENGTH);
+  const authTag = packed.subarray(IV_LENGTH, IV_LENGTH + AUTH_TAG_LENGTH);
+  const encrypted = packed.subarray(IV_LENGTH + AUTH_TAG_LENGTH);
+  const decipher = (0, import_crypto.createDecipheriv)(ALGORITHM, key, iv);
+  decipher.setAuthTag(authTag);
+  return decipher.update(encrypted).toString("utf8") + decipher.final("utf8");
+}
+
+// src/services/key-management.ts
+var import_crypto2 = require("crypto");
+var import_fs4 = require("fs");
+var import_path4 = require("path");
+var import_os4 = require("os");
+var KEY_LENGTH = 32;
+var KEY_FILENAME = ".encryption-key";
+var PBKDF2_ITERATIONS = 6e5;
+function getDataDir() {
+  return process.env.CLAUDE_RECALL_DATA_DIR || (0, import_path4.join)((0, import_os4.homedir)(), ".claude-recall");
+}
+function getKeyPath() {
+  return (0, import_path4.join)(getDataDir(), KEY_FILENAME);
+}
+function deriveMachineKey() {
+  const machineId = `${(0, import_os4.hostname)()}:${(0, import_os4.userInfo)().username}:claude-recall-encryption`;
+  return (0, import_crypto2.pbkdf2Sync)(machineId, "claude-recall-salt-v1", PBKDF2_ITERATIONS, KEY_LENGTH, "sha512");
+}
+function generateRandomKey() {
+  return (0, import_crypto2.randomBytes)(KEY_LENGTH);
+}
+function loadOrCreateKey() {
+  const envKey = process.env.CLAUDE_RECALL_ENCRYPTION_KEY;
+  if (envKey) {
+    const buf = Buffer.from(envKey, "hex");
+    if (buf.length !== KEY_LENGTH) {
+      throw new Error(`CLAUDE_RECALL_ENCRYPTION_KEY must be ${KEY_LENGTH * 2} hex chars (${KEY_LENGTH} bytes)`);
+    }
+    return buf;
+  }
+  const keyPath = getKeyPath();
+  if ((0, import_fs4.existsSync)(keyPath)) {
+    try {
+      const hex3 = (0, import_fs4.readFileSync)(keyPath, "utf8").trim();
+      const buf = Buffer.from(hex3, "hex");
+      if (buf.length === KEY_LENGTH) return buf;
+      logger.warn("ENCRYPTION", "Key file has wrong length, regenerating");
+    } catch {
+      logger.warn("ENCRYPTION", "Failed to read key file, regenerating");
+    }
+  }
+  const key = generateRandomKey();
+  try {
+    (0, import_fs4.writeFileSync)(keyPath, key.toString("hex") + "\n", { mode: 384 });
+    (0, import_fs4.chmodSync)(keyPath, 384);
+    logger.info("ENCRYPTION", "Generated new encryption key");
+  } catch (err) {
+    logger.warn("ENCRYPTION", "Could not persist key file, deriving from machine identity", void 0, err);
+    return deriveMachineKey();
+  }
+  return key;
+}
+var _cachedKey = null;
+function getEncryptionKey() {
+  if (!_cachedKey) {
+    _cachedKey = loadOrCreateKey();
+  }
+  return _cachedKey;
+}
+
 // src/servers/mcp-server.ts
 var packageVersion = typeof __DEFAULT_PACKAGE_VERSION__ !== "undefined" ? __DEFAULT_PACKAGE_VERSION__ : "0.0.0-dev";
 var _originalLog = console["log"];
@@ -21837,6 +21943,14 @@ function finalizeAllStatements() {
     }
   }
   stmtCache.clear();
+}
+function decryptField(value, rowEncrypted) {
+  if (!value || !rowEncrypted) return value;
+  try {
+    return decrypt(value, getEncryptionKey());
+  } catch {
+    return value;
+  }
 }
 function handleSearch(args) {
   const query = args.query || "";
@@ -22091,6 +22205,7 @@ function handleGetObservations(args) {
       `SELECT * FROM raw_observations WHERE id IN (${rawPlaceholders}) ORDER BY created_at_epoch DESC`
     ).all(...rawIds);
     for (const r of rawRows) {
+      const response = decryptField(r.tool_response, r.encrypted);
       results.push({
         source: "raw",
         id: r.id,
@@ -22098,7 +22213,7 @@ function handleGetObservations(args) {
         project: r.project,
         tool_name: r.tool_name,
         tool_input: r.tool_input ? truncate(r.tool_input, maxLen) : null,
-        tool_response: r.tool_response ? truncate(r.tool_response, maxLen) : null,
+        tool_response: response ? truncate(response, maxLen) : null,
         cwd: r.cwd,
         prompt_number: r.prompt_number,
         created_at: r.created_at
@@ -22141,7 +22256,7 @@ function handleGetObservations(args) {
           id: r.id,
           session: r.content_session_id,
           project: r.project,
-          summary: r.summary,
+          summary: decryptField(r.summary, r.encrypted ?? 0),
           prompt_count: r.prompt_count,
           tool_use_count: r.tool_use_count,
           files_touched: r.files_touched,

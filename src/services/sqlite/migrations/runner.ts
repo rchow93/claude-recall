@@ -36,6 +36,7 @@ export class MigrationRunner {
     this.addPrivacyColumns();
     this.createConsolidatedSessionsTable();
     this.addModelAndUsageTracking();
+    this.addEncryptionColumns();
   }
 
   /**
@@ -828,5 +829,36 @@ export class MigrationRunner {
     }
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(25, new Date().toISOString());
+  }
+
+  /**
+   * Add encrypted flag to content tables (migration 26)
+   *
+   * Tracks which rows have AES-256-GCM encrypted content.
+   * Allows mixed encrypted/unencrypted data during gradual migration.
+   */
+  private addEncryptionColumns(): void {
+    const applied = this.db.prepare('SELECT 1 FROM schema_versions WHERE version = 26').get();
+    if (applied) return;
+
+    const obsCols = this.db.prepare('PRAGMA table_info(raw_observations)').all() as TableColumnInfo[];
+    if (!obsCols.some(c => c.name === 'encrypted')) {
+      this.db.run('ALTER TABLE raw_observations ADD COLUMN encrypted INTEGER DEFAULT 0');
+      logger.debug('DB', 'Added encrypted column to raw_observations');
+    }
+
+    const promptCols = this.db.prepare('PRAGMA table_info(user_prompts)').all() as TableColumnInfo[];
+    if (!promptCols.some(c => c.name === 'encrypted')) {
+      this.db.run('ALTER TABLE user_prompts ADD COLUMN encrypted INTEGER DEFAULT 0');
+      logger.debug('DB', 'Added encrypted column to user_prompts');
+    }
+
+    const consCols = this.db.prepare('PRAGMA table_info(consolidated_sessions)').all() as TableColumnInfo[];
+    if (!consCols.some(c => c.name === 'encrypted')) {
+      this.db.run('ALTER TABLE consolidated_sessions ADD COLUMN encrypted INTEGER DEFAULT 0');
+      logger.debug('DB', 'Added encrypted column to consolidated_sessions');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(26, new Date().toISOString());
   }
 }

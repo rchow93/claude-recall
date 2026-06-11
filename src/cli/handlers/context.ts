@@ -29,6 +29,9 @@ import { openDatabase } from '../../services/sqlite/DirectDB.js';
 import { getProjectContext } from '../../utils/project-name.js';
 import { logger } from '../../utils/logger.js';
 import { ensureSidecarRunning, type SidecarInfo } from './sidecar.js';
+import { decrypt } from '../../services/encryption.js';
+import { getEncryptionKey } from '../../services/key-management.js';
+import { encryptExistingData } from '../../services/encrypt-existing.js';
 
 /** Compact summary budget (fallback mode): ~2000 tokens */
 const MAX_SUMMARY_CHARS = 8000;
@@ -51,6 +54,12 @@ interface RawObsRow {
   tool_input: string | null;
   tool_response: string | null;
   prompt_number: number | null;
+  encrypted: number;
+}
+
+function tryDecrypt(value: string | null, rowEncrypted: number): string | null {
+  if (!value || !rowEncrypted) return value;
+  try { return decrypt(value, getEncryptionKey()); } catch { return value; }
 }
 
 interface PromptRow {
@@ -190,7 +199,7 @@ function buildSessionDump(db: any, session: SessionWithActivity, budget: number)
   ).all(sid) as PromptRow[];
 
   const observations = db.prepare(
-    `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number
+    `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number, encrypted
      FROM raw_observations
      WHERE content_session_id = ? AND tool_name != '_assistant_responses'
      ORDER BY id ASC`
@@ -198,14 +207,15 @@ function buildSessionDump(db: any, session: SessionWithActivity, budget: number)
 
   // Get assistant responses snapshot
   const assistantRow = db.prepare(
-    `SELECT tool_response FROM raw_observations
+    `SELECT tool_response, encrypted FROM raw_observations
      WHERE content_session_id = ? AND tool_name = '_assistant_responses'
      ORDER BY id DESC LIMIT 1`
-  ).get(sid) as { tool_response: string } | undefined;
+  ).get(sid) as { tool_response: string; encrypted: number } | undefined;
 
   let assistantResponses: Array<{ prompt_number: number; text: string }> = [];
   if (assistantRow?.tool_response) {
-    try { assistantResponses = JSON.parse(assistantRow.tool_response); } catch {}
+    const raw = tryDecrypt(assistantRow.tool_response, assistantRow.encrypted ?? 0) ?? assistantRow.tool_response;
+    try { assistantResponses = JSON.parse(raw); } catch {}
   }
   const assistantByPrompt = new Map<number, string>();
   for (const r of assistantResponses) {
@@ -282,21 +292,22 @@ function buildCompactSummary(db: any, session: SessionRow): string {
   ).all(sid) as PromptRow[];
 
   const observations = db.prepare(
-    `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number
+    `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number, encrypted
      FROM raw_observations
      WHERE content_session_id = ? AND tool_name != '_assistant_responses'
      ORDER BY id ASC`
   ).all(sid) as RawObsRow[];
 
   const assistantRow = db.prepare(
-    `SELECT tool_response FROM raw_observations
+    `SELECT tool_response, encrypted FROM raw_observations
      WHERE content_session_id = ? AND tool_name = '_assistant_responses'
      ORDER BY id DESC LIMIT 1`
-  ).get(sid) as { tool_response: string } | undefined;
+  ).get(sid) as { tool_response: string; encrypted: number } | undefined;
 
   let assistantResponses: Array<{ prompt_number: number; text: string }> = [];
   if (assistantRow?.tool_response) {
-    try { assistantResponses = JSON.parse(assistantRow.tool_response); } catch {}
+    const raw = tryDecrypt(assistantRow.tool_response, assistantRow.encrypted ?? 0) ?? assistantRow.tool_response;
+    try { assistantResponses = JSON.parse(raw); } catch {}
   }
   const assistantByPrompt = new Map<number, string>();
   for (const r of assistantResponses) {
@@ -481,6 +492,9 @@ export const contextHandler: EventHandler = {
     const cwd = input.cwd ?? process.cwd();
     const context = getProjectContext(cwd);
     const db = openDatabase();
+
+    // Encrypt any existing unencrypted data (runs once, idempotent)
+    try { encryptExistingData(db); } catch { /* non-fatal */ }
 
     let additionalContext = '';
 

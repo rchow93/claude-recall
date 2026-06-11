@@ -26,6 +26,8 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { openDatabase } from '../services/sqlite/DirectDB.js';
 import { parseDateExpression } from '../utils/date-parse.js';
+import { decrypt } from '../services/encryption.js';
+import { getEncryptionKey, encryptionEnabled } from '../services/key-management.js';
 
 import type { Database, Statement } from 'bun:sqlite';
 
@@ -83,6 +85,16 @@ interface RawObsFullRow {
   prompt_number: number | null;
   created_at: string;
   created_at_epoch: number;
+  encrypted: number;
+}
+
+function decryptField(value: string | null, rowEncrypted: number): string | null {
+  if (!value || !rowEncrypted) return value;
+  try {
+    return decrypt(value, getEncryptionKey());
+  } catch {
+    return value;
+  }
 }
 
 interface LegacyObsRow {
@@ -460,6 +472,7 @@ function handleGetObservations(args: Record<string, any>): { content: Array<{ ty
     ).all(...rawIds) as RawObsFullRow[];
 
     for (const r of rawRows) {
+      const response = decryptField(r.tool_response, r.encrypted);
       results.push({
         source: 'raw',
         id: r.id,
@@ -467,7 +480,7 @@ function handleGetObservations(args: Record<string, any>): { content: Array<{ ty
         project: r.project,
         tool_name: r.tool_name,
         tool_input: r.tool_input ? truncate(r.tool_input, maxLen) : null,
-        tool_response: r.tool_response ? truncate(r.tool_response, maxLen) : null,
+        tool_response: response ? truncate(response, maxLen) : null,
         cwd: r.cwd,
         prompt_number: r.prompt_number,
         created_at: r.created_at
@@ -517,7 +530,7 @@ function handleGetObservations(args: Record<string, any>): { content: Array<{ ty
           id: r.id,
           session: r.content_session_id,
           project: r.project,
-          summary: r.summary,
+          summary: decryptField(r.summary, r.encrypted ?? 0),
           prompt_count: r.prompt_count,
           tool_use_count: r.tool_use_count,
           files_touched: r.files_touched,

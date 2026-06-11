@@ -16,6 +16,8 @@ import { computeRelevanceScore } from './relevance.js';
 import { redactSensitiveContent, containsSensitivePatterns } from '../../utils/privacy.js';
 import { consolidateOldSessions, applyTimeDecay, smartCleanup } from '../../services/consolidation.js';
 import { extractLatestUsage, estimateCostUsd } from '../../utils/transcript-usage.js';
+import { encrypt } from '../../services/encryption.js';
+import { getEncryptionKey, encryptionEnabled } from '../../services/key-management.js';
 
 /** Max size for tool_response storage (50KB). Larger responses are truncated. */
 const MAX_RESPONSE_BYTES = 50_000;
@@ -98,9 +100,18 @@ function captureTranscript(db: any, sessionId: string, project: string, cwd: str
   if (responses.length === 0) return;
 
   const responsesJson = JSON.stringify(responses);
-  const capped = responsesJson.length > 50_000
+  let capped: string = responsesJson.length > 50_000
     ? responsesJson.slice(0, 50_000) + '...[truncated]'
     : responsesJson;
+
+  // Encrypt transcript content at rest
+  let transcriptEncrypted = 0;
+  if (encryptionEnabled()) {
+    try {
+      capped = encrypt(capped, getEncryptionKey());
+      transcriptEncrypted = 1;
+    } catch { /* fall through to plaintext */ }
+  }
 
   // Delete previous snapshot for this session, insert fresh one
   db.run(
@@ -108,9 +119,9 @@ function captureTranscript(db: any, sessionId: string, project: string, cwd: str
     [sessionId]
   );
   db.run(
-    `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch)
-     VALUES (?, ?, '_assistant_responses', NULL, ?, ?, ?, ?, ?)`,
-    [sessionId, project, capped, cwd, promptNumber, new Date().toISOString(), nowEpoch]
+    `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, encrypted)
+     VALUES (?, ?, '_assistant_responses', NULL, ?, ?, ?, ?, ?, ?)`,
+    [sessionId, project, capped, cwd, promptNumber, new Date().toISOString(), nowEpoch, transcriptEncrypted]
   );
 
   logger.debug('HOOK', `Captured ${responses.length} assistant responses from transcript`);
@@ -192,10 +203,22 @@ export const observationHandler: EventHandler = {
       const usage = transcriptPath ? extractLatestUsage(transcriptPath) : null;
       const model = usage?.model ?? null;
 
+      // Encrypt tool_response at rest (tool_input stays plaintext for FTS5 search)
+      let encrypted = 0;
+      if (encryptionEnabled() && responseStr) {
+        try {
+          const key = getEncryptionKey();
+          responseStr = encrypt(responseStr, key);
+          encrypted = 1;
+        } catch (err) {
+          logger.warn('ENCRYPTION', 'Failed to encrypt tool_response, storing plaintext', undefined, err as Error);
+        }
+      }
+
       db.run(
-        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, relevance_score, redacted, model)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [sessionId, project, toolName, inputStr, responseStr, cwd, promptNumber, now.toISOString(), nowEpoch, relevanceScore, redacted, model]
+        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, relevance_score, redacted, model, encrypted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, project, toolName, inputStr, responseStr, cwd, promptNumber, now.toISOString(), nowEpoch, relevanceScore, redacted, model, encrypted]
       );
 
       // Upsert per-turn usage into api_usage (deduped by session + prompt_number)

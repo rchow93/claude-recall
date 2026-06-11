@@ -11,6 +11,8 @@ import { openDatabase } from '../../services/sqlite/DirectDB.js';
 import { getProjectName } from '../../utils/project-name.js';
 import { logger } from '../../utils/logger.js';
 import { readFileSync } from 'fs';
+import { encrypt } from '../../services/encryption.js';
+import { getEncryptionKey, encryptionEnabled } from '../../services/key-management.js';
 
 /** Max chars per assistant response to store */
 const MAX_RESPONSE_CHARS = 10_000;
@@ -105,18 +107,26 @@ export const summarizeHandler: EventHandler = {
 
       // Store as a special _assistant_responses observation (replace previous snapshot)
       const responsesJson = JSON.stringify(assistantResponses.map(r => JSON.parse(r)));
-      const capped = responsesJson.length > 50_000
+      let capped: string = responsesJson.length > 50_000
         ? responsesJson.slice(0, 50_000) + '...[truncated]'
         : responsesJson;
+
+      let stopEncrypted = 0;
+      if (encryptionEnabled()) {
+        try {
+          capped = encrypt(capped, getEncryptionKey());
+          stopEncrypted = 1;
+        } catch { /* fall through to plaintext */ }
+      }
 
       db.run(
         `DELETE FROM raw_observations WHERE content_session_id = ? AND tool_name = '_assistant_responses'`,
         [sessionId]
       );
       db.run(
-        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch)
-         VALUES (?, ?, '_assistant_responses', NULL, ?, ?, ?, ?, ?)`,
-        [sessionId, project, capped, cwd, promptNumber, now.toISOString(), nowEpoch]
+        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, encrypted)
+         VALUES (?, ?, '_assistant_responses', NULL, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, project, capped, cwd, promptNumber, now.toISOString(), nowEpoch, stopEncrypted]
       );
 
       logger.debug('HOOK', `Stored ${assistantResponses.length} assistant responses from transcript`);

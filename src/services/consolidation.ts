@@ -12,6 +12,8 @@
 
 import type { Database } from 'bun:sqlite';
 import { logger } from '../utils/logger.js';
+import { encrypt } from './encryption.js';
+import { getEncryptionKey, encryptionEnabled } from './key-management.js';
 
 /** Keep this many recent sessions per project before consolidating older ones */
 const SESSIONS_TO_KEEP_PER_PROJECT = 20;
@@ -113,20 +115,32 @@ export function consolidateOldSessions(db: Database): void {
         }
       }
 
+      // Encrypt summary at rest if encryption is enabled
+      let storedSummary = summary;
+      let summaryEncrypted = 0;
+      if (encryptionEnabled()) {
+        try {
+          storedSummary = encrypt(summary, getEncryptionKey());
+          summaryEncrypted = 1;
+        } catch (err) {
+          logger.warn('ENCRYPTION', 'Failed to encrypt session summary, storing plaintext', undefined, err as Error);
+        }
+      }
+
       // Store consolidated summary
       db.run(
         `INSERT INTO consolidated_sessions
          (content_session_id, project, summary, prompt_count, tool_use_count,
           files_touched, commands_run, original_started_at, original_started_at_epoch,
-          consolidated_at, consolidated_at_epoch)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          consolidated_at, consolidated_at_epoch, encrypted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          session.content_session_id, session.project, summary,
+          session.content_session_id, session.project, storedSummary,
           session.prompt_counter, toolCount,
           JSON.stringify([...files].slice(0, 30)),
           JSON.stringify(commands.slice(0, 15)),
           session.started_at, session.started_at_epoch,
-          nowIso, nowEpoch
+          nowIso, nowEpoch, summaryEncrypted
         ]
       );
 

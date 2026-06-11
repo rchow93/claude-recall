@@ -98,9 +98,9 @@ function getPlatformAdapter(platform2) {
 }
 
 // src/cli/handlers/context.ts
-import { readFileSync as readFileSync4, writeFileSync as writeFileSync3, mkdirSync as mkdirSync4, existsSync as existsSync5 } from "fs";
-import { join as join5 } from "path";
-import { homedir as homedir4 } from "os";
+import { readFileSync as readFileSync5, writeFileSync as writeFileSync4, mkdirSync as mkdirSync4, existsSync as existsSync6 } from "fs";
+import { join as join6 } from "path";
+import { homedir as homedir5 } from "os";
 
 // src/services/sqlite/DirectDB.ts
 import { Database } from "bun:sqlite";
@@ -594,6 +594,7 @@ var MigrationRunner = class {
     this.addPrivacyColumns();
     this.createConsolidatedSessionsTable();
     this.addModelAndUsageTracking();
+    this.addEncryptionColumns();
   }
   /**
    * Initialize database schema using migrations (migration004)
@@ -1196,6 +1197,32 @@ var MigrationRunner = class {
     }
     this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(25, (/* @__PURE__ */ new Date()).toISOString());
   }
+  /**
+   * Add encrypted flag to content tables (migration 26)
+   *
+   * Tracks which rows have AES-256-GCM encrypted content.
+   * Allows mixed encrypted/unencrypted data during gradual migration.
+   */
+  addEncryptionColumns() {
+    const applied = this.db.prepare("SELECT 1 FROM schema_versions WHERE version = 26").get();
+    if (applied) return;
+    const obsCols = this.db.prepare("PRAGMA table_info(raw_observations)").all();
+    if (!obsCols.some((c) => c.name === "encrypted")) {
+      this.db.run("ALTER TABLE raw_observations ADD COLUMN encrypted INTEGER DEFAULT 0");
+      logger.debug("DB", "Added encrypted column to raw_observations");
+    }
+    const promptCols = this.db.prepare("PRAGMA table_info(user_prompts)").all();
+    if (!promptCols.some((c) => c.name === "encrypted")) {
+      this.db.run("ALTER TABLE user_prompts ADD COLUMN encrypted INTEGER DEFAULT 0");
+      logger.debug("DB", "Added encrypted column to user_prompts");
+    }
+    const consCols = this.db.prepare("PRAGMA table_info(consolidated_sessions)").all();
+    if (!consCols.some((c) => c.name === "encrypted")) {
+      this.db.run("ALTER TABLE consolidated_sessions ADD COLUMN encrypted INTEGER DEFAULT 0");
+      logger.debug("DB", "Added encrypted column to consolidated_sessions");
+    }
+    this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(26, (/* @__PURE__ */ new Date()).toISOString());
+  }
 };
 
 // src/services/sqlite/DirectDB.ts
@@ -1339,6 +1366,152 @@ async function ensureSidecarRunning() {
   }
 }
 
+// src/services/encryption.ts
+import { createCipheriv, createDecipheriv, randomBytes as randomBytes2 } from "crypto";
+var ALGORITHM = "aes-256-gcm";
+var IV_LENGTH = 12;
+var AUTH_TAG_LENGTH = 16;
+var ENCRYPTED_PREFIX = "$ENCRYPTED$";
+function encrypt(plaintext, key) {
+  const iv = randomBytes2(IV_LENGTH);
+  const cipher = createCipheriv(ALGORITHM, key, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  const packed = Buffer.concat([iv, authTag, encrypted]);
+  return ENCRYPTED_PREFIX + packed.toString("base64");
+}
+function decrypt(ciphertext, key) {
+  if (!ciphertext.startsWith(ENCRYPTED_PREFIX)) {
+    return ciphertext;
+  }
+  const packed = Buffer.from(ciphertext.slice(ENCRYPTED_PREFIX.length), "base64");
+  const iv = packed.subarray(0, IV_LENGTH);
+  const authTag = packed.subarray(IV_LENGTH, IV_LENGTH + AUTH_TAG_LENGTH);
+  const encrypted = packed.subarray(IV_LENGTH + AUTH_TAG_LENGTH);
+  const decipher = createDecipheriv(ALGORITHM, key, iv);
+  decipher.setAuthTag(authTag);
+  return decipher.update(encrypted).toString("utf8") + decipher.final("utf8");
+}
+
+// src/services/key-management.ts
+import { randomBytes as randomBytes3, pbkdf2Sync } from "crypto";
+import { readFileSync as readFileSync4, writeFileSync as writeFileSync3, chmodSync, existsSync as existsSync5 } from "fs";
+import { join as join5 } from "path";
+import { homedir as homedir4, hostname, userInfo } from "os";
+var KEY_LENGTH = 32;
+var KEY_FILENAME = ".encryption-key";
+var PBKDF2_ITERATIONS = 6e5;
+function getDataDir() {
+  return process.env.CLAUDE_RECALL_DATA_DIR || join5(homedir4(), ".claude-recall");
+}
+function getKeyPath() {
+  return join5(getDataDir(), KEY_FILENAME);
+}
+function deriveMachineKey() {
+  const machineId = `${hostname()}:${userInfo().username}:claude-recall-encryption`;
+  return pbkdf2Sync(machineId, "claude-recall-salt-v1", PBKDF2_ITERATIONS, KEY_LENGTH, "sha512");
+}
+function generateRandomKey() {
+  return randomBytes3(KEY_LENGTH);
+}
+function loadOrCreateKey() {
+  const envKey = process.env.CLAUDE_RECALL_ENCRYPTION_KEY;
+  if (envKey) {
+    const buf = Buffer.from(envKey, "hex");
+    if (buf.length !== KEY_LENGTH) {
+      throw new Error(`CLAUDE_RECALL_ENCRYPTION_KEY must be ${KEY_LENGTH * 2} hex chars (${KEY_LENGTH} bytes)`);
+    }
+    return buf;
+  }
+  const keyPath = getKeyPath();
+  if (existsSync5(keyPath)) {
+    try {
+      const hex = readFileSync4(keyPath, "utf8").trim();
+      const buf = Buffer.from(hex, "hex");
+      if (buf.length === KEY_LENGTH) return buf;
+      logger.warn("ENCRYPTION", "Key file has wrong length, regenerating");
+    } catch {
+      logger.warn("ENCRYPTION", "Failed to read key file, regenerating");
+    }
+  }
+  const key = generateRandomKey();
+  try {
+    writeFileSync3(keyPath, key.toString("hex") + "\n", { mode: 384 });
+    chmodSync(keyPath, 384);
+    logger.info("ENCRYPTION", "Generated new encryption key");
+  } catch (err) {
+    logger.warn("ENCRYPTION", "Could not persist key file, deriving from machine identity", void 0, err);
+    return deriveMachineKey();
+  }
+  return key;
+}
+function encryptionEnabled() {
+  return (process.env.CLAUDE_RECALL_ENCRYPTION ?? "on").toLowerCase() !== "off";
+}
+var _cachedKey = null;
+function getEncryptionKey() {
+  if (!_cachedKey) {
+    _cachedKey = loadOrCreateKey();
+  }
+  return _cachedKey;
+}
+
+// src/services/encrypt-existing.ts
+var BATCH_SIZE = 500;
+function encryptExistingData(db) {
+  if (!encryptionEnabled()) return;
+  const key = getEncryptionKey();
+  const unencryptedObs = db.prepare(
+    "SELECT COUNT(*) as cnt FROM raw_observations WHERE encrypted = 0 AND tool_response IS NOT NULL"
+  ).get()?.cnt ?? 0;
+  const unencryptedCons = db.prepare(
+    "SELECT COUNT(*) as cnt FROM consolidated_sessions WHERE encrypted = 0"
+  ).get()?.cnt ?? 0;
+  if (unencryptedObs === 0 && unencryptedCons === 0) return;
+  logger.info("ENCRYPTION", `Encrypting existing data: ${unencryptedObs} observations, ${unencryptedCons} consolidated sessions`);
+  let obsEncrypted = 0;
+  const updateObs = db.prepare("UPDATE raw_observations SET tool_response = ?, encrypted = 1 WHERE id = ?");
+  while (true) {
+    const rows = db.prepare(
+      "SELECT id, tool_response FROM raw_observations WHERE encrypted = 0 AND tool_response IS NOT NULL LIMIT ?"
+    ).all(BATCH_SIZE);
+    if (rows.length === 0) break;
+    const tx = db.transaction(() => {
+      for (const row of rows) {
+        try {
+          const encrypted = encrypt(row.tool_response, key);
+          updateObs.run(encrypted, row.id);
+          obsEncrypted++;
+        } catch {
+          db.run("UPDATE raw_observations SET encrypted = 0 WHERE id = ?", [row.id]);
+        }
+      }
+    });
+    tx();
+  }
+  let consEncrypted = 0;
+  const updateCons = db.prepare("UPDATE consolidated_sessions SET summary = ?, encrypted = 1 WHERE id = ?");
+  while (true) {
+    const rows = db.prepare(
+      "SELECT id, summary FROM consolidated_sessions WHERE encrypted = 0 LIMIT ?"
+    ).all(BATCH_SIZE);
+    if (rows.length === 0) break;
+    const tx = db.transaction(() => {
+      for (const row of rows) {
+        try {
+          const encrypted = encrypt(row.summary, key);
+          updateCons.run(encrypted, row.id);
+          consEncrypted++;
+        } catch {
+          db.run("UPDATE consolidated_sessions SET encrypted = 0 WHERE id = ?", [row.id]);
+        }
+      }
+    });
+    tx();
+  }
+  logger.info("ENCRYPTION", `Encrypted ${obsEncrypted} observations, ${consEncrypted} consolidated sessions`);
+}
+
 // src/cli/handlers/context.ts
 var MAX_SUMMARY_CHARS = 8e3;
 var RECOVERY_MODE = (process.env.CLAUDE_RECALL_RECOVERY_MODE ?? "full").toLowerCase();
@@ -1346,6 +1519,14 @@ var RECOVERY_WINDOW_HOURS = Number(process.env.CLAUDE_RECALL_RECOVERY_WINDOW_HOU
 var RECOVERY_BUDGET_TOKENS = Number(process.env.CLAUDE_RECALL_RECOVERY_BUDGET_TOKENS) || 2e5;
 var CHARS_PER_TOKEN = 4;
 var RECOVERY_BUDGET_CHARS = RECOVERY_BUDGET_TOKENS * CHARS_PER_TOKEN;
+function tryDecrypt(value, rowEncrypted) {
+  if (!value || !rowEncrypted) return value;
+  try {
+    return decrypt(value, getEncryptionKey());
+  } catch {
+    return value;
+  }
+}
 function formatTimeAgo(epoch, now) {
   const seconds = now - epoch;
   if (seconds < 60) return "just now";
@@ -1440,20 +1621,21 @@ function buildSessionDump(db, session, budget) {
      WHERE content_session_id = ? ORDER BY prompt_number ASC`
   ).all(sid);
   const observations = db.prepare(
-    `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number
+    `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number, encrypted
      FROM raw_observations
      WHERE content_session_id = ? AND tool_name != '_assistant_responses'
      ORDER BY id ASC`
   ).all(sid);
   const assistantRow = db.prepare(
-    `SELECT tool_response FROM raw_observations
+    `SELECT tool_response, encrypted FROM raw_observations
      WHERE content_session_id = ? AND tool_name = '_assistant_responses'
      ORDER BY id DESC LIMIT 1`
   ).get(sid);
   let assistantResponses = [];
   if (assistantRow?.tool_response) {
+    const raw = tryDecrypt(assistantRow.tool_response, assistantRow.encrypted ?? 0) ?? assistantRow.tool_response;
     try {
-      assistantResponses = JSON.parse(assistantRow.tool_response);
+      assistantResponses = JSON.parse(raw);
     } catch {
     }
   }
@@ -1518,20 +1700,21 @@ function buildCompactSummary(db, session) {
      WHERE content_session_id = ? ORDER BY prompt_number ASC`
   ).all(sid);
   const observations = db.prepare(
-    `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number
+    `SELECT id, content_session_id, tool_name, tool_input, tool_response, prompt_number, encrypted
      FROM raw_observations
      WHERE content_session_id = ? AND tool_name != '_assistant_responses'
      ORDER BY id ASC`
   ).all(sid);
   const assistantRow = db.prepare(
-    `SELECT tool_response FROM raw_observations
+    `SELECT tool_response, encrypted FROM raw_observations
      WHERE content_session_id = ? AND tool_name = '_assistant_responses'
      ORDER BY id DESC LIMIT 1`
   ).get(sid);
   let assistantResponses = [];
   if (assistantRow?.tool_response) {
+    const raw = tryDecrypt(assistantRow.tool_response, assistantRow.encrypted ?? 0) ?? assistantRow.tool_response;
     try {
-      assistantResponses = JSON.parse(assistantRow.tool_response);
+      assistantResponses = JSON.parse(raw);
     } catch {
     }
   }
@@ -1673,16 +1856,16 @@ You have access to claude-recall MCP tools for searching past conversation histo
 <!-- end-claude-recall-instructions -->`;
 function ensureClaudeMdInstructions() {
   try {
-    const claudeMdPath = join5(homedir4(), ".claude", "CLAUDE.md");
-    const claudeDir = join5(homedir4(), ".claude");
-    if (!existsSync5(claudeDir)) {
+    const claudeMdPath = join6(homedir5(), ".claude", "CLAUDE.md");
+    const claudeDir = join6(homedir5(), ".claude");
+    if (!existsSync6(claudeDir)) {
       mkdirSync4(claudeDir, { recursive: true });
     }
-    if (existsSync5(claudeMdPath)) {
-      const content = readFileSync4(claudeMdPath, "utf-8");
+    if (existsSync6(claudeMdPath)) {
+      const content = readFileSync5(claudeMdPath, "utf-8");
       if (content.includes(CLAUDE_MD_MARKER)) return;
     }
-    writeFileSync3(claudeMdPath, (existsSync5(claudeMdPath) ? readFileSync4(claudeMdPath, "utf-8") : "") + CLAUDE_MD_BLOCK, "utf-8");
+    writeFileSync4(claudeMdPath, (existsSync6(claudeMdPath) ? readFileSync5(claudeMdPath, "utf-8") : "") + CLAUDE_MD_BLOCK, "utf-8");
     logger.debug("HOOK", "Injected recall instructions into ~/.claude/CLAUDE.md");
   } catch {
   }
@@ -1701,6 +1884,10 @@ var contextHandler = {
     const cwd = input.cwd ?? process.cwd();
     const context = getProjectContext(cwd);
     const db = openDatabase();
+    try {
+      encryptExistingData(db);
+    } catch {
+    }
     let additionalContext = "";
     try {
       const projects = context.allProjects;
@@ -1844,7 +2031,7 @@ var sessionInitHandler = {
 };
 
 // src/cli/handlers/observation.ts
-import { readFileSync as readFileSync5 } from "fs";
+import { readFileSync as readFileSync6 } from "fs";
 
 // src/cli/handlers/relevance.ts
 var LOW_SIGNAL_FILES = /* @__PURE__ */ new Set([
@@ -2012,16 +2199,26 @@ function consolidateOldSessions(db) {
           commands.push(typeof input.command === "string" ? input.command.slice(0, 100) : "");
         }
       }
+      let storedSummary = summary;
+      let summaryEncrypted = 0;
+      if (encryptionEnabled()) {
+        try {
+          storedSummary = encrypt(summary, getEncryptionKey());
+          summaryEncrypted = 1;
+        } catch (err) {
+          logger.warn("ENCRYPTION", "Failed to encrypt session summary, storing plaintext", void 0, err);
+        }
+      }
       db.run(
         `INSERT INTO consolidated_sessions
          (content_session_id, project, summary, prompt_count, tool_use_count,
           files_touched, commands_run, original_started_at, original_started_at_epoch,
-          consolidated_at, consolidated_at_epoch)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          consolidated_at, consolidated_at_epoch, encrypted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           session.content_session_id,
           session.project,
-          summary,
+          storedSummary,
           session.prompt_counter,
           toolCount,
           JSON.stringify([...files].slice(0, 30)),
@@ -2029,7 +2226,8 @@ function consolidateOldSessions(db) {
           session.started_at,
           session.started_at_epoch,
           nowIso,
-          nowEpoch
+          nowEpoch,
+          summaryEncrypted
         ]
       );
       db.run("DELETE FROM raw_observations WHERE content_session_id = ?", [session.content_session_id]);
@@ -2176,7 +2374,7 @@ function extractText(content) {
 function captureTranscript(db, sessionId, project, cwd, transcriptPath, nowEpoch) {
   let data;
   try {
-    data = readFileSync5(transcriptPath, "utf-8");
+    data = readFileSync6(transcriptPath, "utf-8");
   } catch {
     return;
   }
@@ -2203,15 +2401,23 @@ function captureTranscript(db, sessionId, project, cwd, transcriptPath, nowEpoch
   }
   if (responses.length === 0) return;
   const responsesJson = JSON.stringify(responses);
-  const capped = responsesJson.length > 5e4 ? responsesJson.slice(0, 5e4) + "...[truncated]" : responsesJson;
+  let capped = responsesJson.length > 5e4 ? responsesJson.slice(0, 5e4) + "...[truncated]" : responsesJson;
+  let transcriptEncrypted = 0;
+  if (encryptionEnabled()) {
+    try {
+      capped = encrypt(capped, getEncryptionKey());
+      transcriptEncrypted = 1;
+    } catch {
+    }
+  }
   db.run(
     `DELETE FROM raw_observations WHERE content_session_id = ? AND tool_name = '_assistant_responses'`,
     [sessionId]
   );
   db.run(
-    `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch)
-     VALUES (?, ?, '_assistant_responses', NULL, ?, ?, ?, ?, ?)`,
-    [sessionId, project, capped, cwd, promptNumber, (/* @__PURE__ */ new Date()).toISOString(), nowEpoch]
+    `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, encrypted)
+     VALUES (?, ?, '_assistant_responses', NULL, ?, ?, ?, ?, ?, ?)`,
+    [sessionId, project, capped, cwd, promptNumber, (/* @__PURE__ */ new Date()).toISOString(), nowEpoch, transcriptEncrypted]
   );
   logger.debug("HOOK", `Captured ${responses.length} assistant responses from transcript`);
 }
@@ -2271,10 +2477,20 @@ var observationHandler = {
       });
       const usage = transcriptPath ? extractLatestUsage(transcriptPath) : null;
       const model = usage?.model ?? null;
+      let encrypted = 0;
+      if (encryptionEnabled() && responseStr) {
+        try {
+          const key = getEncryptionKey();
+          responseStr = encrypt(responseStr, key);
+          encrypted = 1;
+        } catch (err) {
+          logger.warn("ENCRYPTION", "Failed to encrypt tool_response, storing plaintext", void 0, err);
+        }
+      }
       db.run(
-        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, relevance_score, redacted, model)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [sessionId, project, toolName, inputStr, responseStr, cwd, promptNumber, now.toISOString(), nowEpoch, relevanceScore, redacted, model]
+        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, relevance_score, redacted, model, encrypted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, project, toolName, inputStr, responseStr, cwd, promptNumber, now.toISOString(), nowEpoch, relevanceScore, redacted, model, encrypted]
       );
       if (usage && promptNumber > 0) {
         const costUsd = estimateCostUsd(usage);
@@ -2339,7 +2555,7 @@ var observationHandler = {
 };
 
 // src/cli/handlers/summarize.ts
-import { readFileSync as readFileSync6 } from "fs";
+import { readFileSync as readFileSync7 } from "fs";
 var MAX_RESPONSE_CHARS = 1e4;
 function extractText2(content) {
   if (typeof content === "string") return content;
@@ -2356,7 +2572,7 @@ var summarizeHandler = {
     }
     let transcriptData;
     try {
-      transcriptData = readFileSync6(transcriptPath, "utf-8");
+      transcriptData = readFileSync7(transcriptPath, "utf-8");
     } catch (err) {
       logger.debug("HOOK", `Could not read transcript: ${err}`);
       return { continue: true, suppressOutput: true };
@@ -2398,15 +2614,23 @@ var summarizeHandler = {
         [sessionId, project, now.toISOString(), nowEpoch]
       );
       const responsesJson = JSON.stringify(assistantResponses.map((r) => JSON.parse(r)));
-      const capped = responsesJson.length > 5e4 ? responsesJson.slice(0, 5e4) + "...[truncated]" : responsesJson;
+      let capped = responsesJson.length > 5e4 ? responsesJson.slice(0, 5e4) + "...[truncated]" : responsesJson;
+      let stopEncrypted = 0;
+      if (encryptionEnabled()) {
+        try {
+          capped = encrypt(capped, getEncryptionKey());
+          stopEncrypted = 1;
+        } catch {
+        }
+      }
       db.run(
         `DELETE FROM raw_observations WHERE content_session_id = ? AND tool_name = '_assistant_responses'`,
         [sessionId]
       );
       db.run(
-        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch)
-         VALUES (?, ?, '_assistant_responses', NULL, ?, ?, ?, ?, ?)`,
-        [sessionId, project, capped, cwd, promptNumber, now.toISOString(), nowEpoch]
+        `INSERT INTO raw_observations (content_session_id, project, tool_name, tool_input, tool_response, cwd, prompt_number, created_at, created_at_epoch, encrypted)
+         VALUES (?, ?, '_assistant_responses', NULL, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, project, capped, cwd, promptNumber, now.toISOString(), nowEpoch, stopEncrypted]
       );
       logger.debug("HOOK", `Stored ${assistantResponses.length} assistant responses from transcript`);
     } finally {
@@ -2421,8 +2645,8 @@ import { basename as basename2 } from "path";
 
 // src/shared/worker-utils.ts
 import path2 from "path";
-import { homedir as homedir5 } from "os";
-import { readFileSync as readFileSync7 } from "fs";
+import { homedir as homedir6 } from "os";
+import { readFileSync as readFileSync8 } from "fs";
 
 // src/shared/hook-constants.ts
 var HOOK_TIMEOUTS = {
@@ -2483,7 +2707,7 @@ ${message}`;
 }
 
 // src/shared/worker-utils.ts
-var MARKETPLACE_ROOT = path2.join(homedir5(), ".claude", "plugins", "marketplaces", "askqai");
+var MARKETPLACE_ROOT = path2.join(homedir6(), ".claude", "plugins", "marketplaces", "askqai");
 var HEALTH_CHECK_TIMEOUT_MS = getTimeout(HOOK_TIMEOUTS.HEALTH_CHECK);
 var cachedPort = null;
 function getWorkerPort() {
@@ -2502,7 +2726,7 @@ async function isWorkerHealthy() {
 }
 function getPluginVersion() {
   const packageJsonPath = path2.join(MARKETPLACE_ROOT, "package.json");
-  const packageJson = JSON.parse(readFileSync7(packageJsonPath, "utf-8"));
+  const packageJson = JSON.parse(readFileSync8(packageJsonPath, "utf-8"));
   return packageJson.version;
 }
 async function getWorkerVersion() {
