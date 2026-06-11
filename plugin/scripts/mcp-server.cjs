@@ -21958,6 +21958,48 @@ function getEncryptionKey() {
   return _cachedKey;
 }
 
+// src/utils/message-rules.ts
+var import_fs5 = require("fs");
+var import_path5 = require("path");
+var import_os5 = require("os");
+var rulesCache = null;
+var rulesMtime = 0;
+var resolvedPath = null;
+function getRulesPath() {
+  if (resolvedPath) return resolvedPath;
+  resolvedPath = process.env.CLAUDE_RECALL_MESSAGE_RULES ?? (0, import_path5.join)(process.env.CLAUDE_RECALL_DATA_DIR ?? (0, import_path5.join)((0, import_os5.homedir)(), ".claude-recall"), "message-rules.json");
+  return resolvedPath;
+}
+function loadAutoApproveRules() {
+  try {
+    const path = getRulesPath();
+    if (!(0, import_fs5.existsSync)(path)) return [];
+    const stat = (0, import_fs5.statSync)(path);
+    const mtime = stat.mtimeMs;
+    if (rulesCache && mtime === rulesMtime) return rulesCache.auto_approve ?? [];
+    const raw = (0, import_fs5.readFileSync)(path, "utf-8");
+    rulesCache = JSON.parse(raw);
+    rulesMtime = mtime;
+    return rulesCache.auto_approve ?? [];
+  } catch {
+    return [];
+  }
+}
+function matchesAutoApproveRule(from, to, type, priority) {
+  const rules = loadAutoApproveRules();
+  return matchesRules(rules, from, to, type, priority);
+}
+function matchesRules(rules, from, to, type, priority) {
+  for (const rule of rules) {
+    const fromMatch = rule.from === "*" || rule.from === from;
+    const toMatch = rule.to === "*" || rule.to === to;
+    const typeMatch = !rule.type || rule.type === "*" || rule.type === type;
+    const priorityMatch = !rule.priority || rule.priority === "*" || rule.priority === priority;
+    if (fromMatch && toMatch && typeMatch && priorityMatch) return true;
+  }
+  return false;
+}
+
 // src/servers/mcp-server.ts
 var packageVersion = typeof __DEFAULT_PACKAGE_VERSION__ !== "undefined" ? __DEFAULT_PACKAGE_VERSION__ : "0.0.0-dev";
 var _originalLog = console["log"];
@@ -22431,14 +22473,20 @@ function handleSendMessage(args) {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
   `).run(from, sourceSessionId, to, messageType, priority, subject, message, parentMessageId, nowEpoch, ttlSeconds);
   const messageId = Number(result.lastInsertRowid);
+  let autoApproved = false;
+  if (matchesAutoApproveRule(from, to, messageType, priority)) {
+    cachedPrepare(
+      `UPDATE inter_session_messages SET status = 'approved', approved_at_epoch = ? WHERE id = ?`
+    ).run(nowEpoch, messageId);
+    autoApproved = true;
+  }
   const parts = [
     `Message #${messageId} sent to **${to}**.`,
     `Type: ${messageType} | Priority: ${priority} | TTL: ${ttlHours}h`,
     subject ? `Subject: ${subject}` : null,
     parentMessageId ? `Thread: reply to #${parentMessageId}` : null,
     "",
-    "Status: **pending_approval** \u2014 awaiting operator approval in the pro dashboard.",
-    "The target session will receive this message via hook injection once approved."
+    autoApproved ? "Status: **approved** (auto-approved by matching rule). The target session will receive this message on its next tool use." : "Status: **pending_approval** \u2014 awaiting operator approval in the pro dashboard.\nThe target session will receive this message via hook injection once approved."
   ].filter(Boolean);
   return { content: [{ type: "text", text: parts.join("\n") }] };
 }

@@ -1,6 +1,10 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { MigrationRunner } from '../src/services/sqlite/migrations/runner';
+import { matchesRules, matchesAutoApproveRule, resetRulesCache } from '../src/utils/message-rules';
+import { writeFileSync, unlinkSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 let db: Database;
 
@@ -1158,5 +1162,139 @@ describe('migration 27 — idempotent', () => {
 
     const versions = db.prepare('SELECT COUNT(*) as cnt FROM schema_versions WHERE version = 27').get() as { cnt: number };
     expect(versions.cnt).toBe(1);
+  });
+});
+
+// --- Auto-approve rule matching ---
+
+describe('auto-approve — matchesRules (pure logic)', () => {
+  test('exact match on from and to', () => {
+    const rules = [{ from: 'AlphaProject', to: 'BetaProject' }];
+    expect(matchesRules(rules, 'AlphaProject', 'BetaProject', 'request', 'normal')).toBe(true);
+    expect(matchesRules(rules, 'AlphaProject', 'GammaProject', 'request', 'normal')).toBe(false);
+    expect(matchesRules(rules, 'GammaProject', 'BetaProject', 'request', 'normal')).toBe(false);
+  });
+
+  test('wildcard * matches any project', () => {
+    const rules = [{ from: '*', to: 'BetaProject' }];
+    expect(matchesRules(rules, 'AlphaProject', 'BetaProject', 'request', 'normal')).toBe(true);
+    expect(matchesRules(rules, 'AnyProject', 'BetaProject', 'notify', 'high')).toBe(true);
+    expect(matchesRules(rules, 'AlphaProject', 'GammaProject', 'request', 'normal')).toBe(false);
+  });
+
+  test('wildcard * on both from and to matches everything', () => {
+    const rules = [{ from: '*', to: '*' }];
+    expect(matchesRules(rules, 'A', 'B', 'request', 'normal')).toBe(true);
+    expect(matchesRules(rules, 'X', 'Y', 'question', 'urgent')).toBe(true);
+  });
+
+  test('type filter restricts matching', () => {
+    const rules = [{ from: '*', to: '*', type: 'notify' }];
+    expect(matchesRules(rules, 'A', 'B', 'notify', 'normal')).toBe(true);
+    expect(matchesRules(rules, 'A', 'B', 'request', 'normal')).toBe(false);
+    expect(matchesRules(rules, 'A', 'B', 'question', 'normal')).toBe(false);
+  });
+
+  test('priority filter restricts matching', () => {
+    const rules = [{ from: '*', to: '*', priority: 'low' }];
+    expect(matchesRules(rules, 'A', 'B', 'request', 'low')).toBe(true);
+    expect(matchesRules(rules, 'A', 'B', 'request', 'normal')).toBe(false);
+    expect(matchesRules(rules, 'A', 'B', 'request', 'urgent')).toBe(false);
+  });
+
+  test('type * acts as wildcard', () => {
+    const rules = [{ from: 'A', to: 'B', type: '*' }];
+    expect(matchesRules(rules, 'A', 'B', 'request', 'normal')).toBe(true);
+    expect(matchesRules(rules, 'A', 'B', 'notify', 'normal')).toBe(true);
+    expect(matchesRules(rules, 'A', 'B', 'question', 'normal')).toBe(true);
+  });
+
+  test('omitted type/priority matches everything', () => {
+    const rules = [{ from: 'A', to: 'B' }];
+    expect(matchesRules(rules, 'A', 'B', 'request', 'normal')).toBe(true);
+    expect(matchesRules(rules, 'A', 'B', 'notify', 'urgent')).toBe(true);
+    expect(matchesRules(rules, 'A', 'B', 'question', 'low')).toBe(true);
+  });
+
+  test('multiple rules — first match wins', () => {
+    const rules = [
+      { from: 'A', to: 'B', type: 'notify' },
+      { from: '*', to: '*', type: 'request', priority: 'urgent' },
+    ];
+    expect(matchesRules(rules, 'A', 'B', 'notify', 'normal')).toBe(true);
+    expect(matchesRules(rules, 'X', 'Y', 'request', 'urgent')).toBe(true);
+    expect(matchesRules(rules, 'X', 'Y', 'request', 'normal')).toBe(false);
+    expect(matchesRules(rules, 'A', 'B', 'request', 'normal')).toBe(false);
+  });
+
+  test('empty rules array matches nothing', () => {
+    expect(matchesRules([], 'A', 'B', 'request', 'normal')).toBe(false);
+  });
+
+  test('combined type + priority filter', () => {
+    const rules = [{ from: 'SmartRouter', to: 'WorkWeek', type: 'notify', priority: 'low' }];
+    expect(matchesRules(rules, 'SmartRouter', 'WorkWeek', 'notify', 'low')).toBe(true);
+    expect(matchesRules(rules, 'SmartRouter', 'WorkWeek', 'notify', 'high')).toBe(false);
+    expect(matchesRules(rules, 'SmartRouter', 'WorkWeek', 'request', 'low')).toBe(false);
+  });
+});
+
+describe('auto-approve — file-based integration', () => {
+  const tmpRulesPath = join(tmpdir(), `test-rules-${process.pid}.json`);
+
+  afterAll(() => {
+    try { unlinkSync(tmpRulesPath); } catch {}
+    delete process.env.CLAUDE_RECALL_MESSAGE_RULES;
+    resetRulesCache();
+  });
+
+  test('loads rules from file specified by env var', () => {
+    const config = {
+      auto_approve: [
+        { from: 'TestProject', to: 'OtherProject', type: 'notify' }
+      ]
+    };
+    writeFileSync(tmpRulesPath, JSON.stringify(config));
+    process.env.CLAUDE_RECALL_MESSAGE_RULES = tmpRulesPath;
+    resetRulesCache();
+
+    expect(matchesAutoApproveRule('TestProject', 'OtherProject', 'notify', 'normal')).toBe(true);
+    expect(matchesAutoApproveRule('TestProject', 'OtherProject', 'request', 'normal')).toBe(false);
+  });
+
+  test('returns false when rules file does not exist', () => {
+    process.env.CLAUDE_RECALL_MESSAGE_RULES = join(tmpdir(), 'nonexistent-rules.json');
+    resetRulesCache();
+
+    expect(matchesAutoApproveRule('A', 'B', 'request', 'normal')).toBe(false);
+  });
+
+  test('caches rules by mtime — reloads when file changes', () => {
+    process.env.CLAUDE_RECALL_MESSAGE_RULES = tmpRulesPath;
+
+    writeFileSync(tmpRulesPath, JSON.stringify({ auto_approve: [{ from: '*', to: '*' }] }));
+    resetRulesCache();
+    expect(matchesAutoApproveRule('A', 'B', 'request', 'normal')).toBe(true);
+
+    writeFileSync(tmpRulesPath, JSON.stringify({ auto_approve: [{ from: 'X', to: 'Y' }] }));
+    resetRulesCache();
+    expect(matchesAutoApproveRule('A', 'B', 'request', 'normal')).toBe(false);
+    expect(matchesAutoApproveRule('X', 'Y', 'request', 'normal')).toBe(true);
+  });
+
+  test('handles malformed JSON gracefully', () => {
+    writeFileSync(tmpRulesPath, '{ this is not json');
+    process.env.CLAUDE_RECALL_MESSAGE_RULES = tmpRulesPath;
+    resetRulesCache();
+
+    expect(matchesAutoApproveRule('A', 'B', 'request', 'normal')).toBe(false);
+  });
+
+  test('handles missing auto_approve key gracefully', () => {
+    writeFileSync(tmpRulesPath, JSON.stringify({ other_key: 'value' }));
+    process.env.CLAUDE_RECALL_MESSAGE_RULES = tmpRulesPath;
+    resetRulesCache();
+
+    expect(matchesAutoApproveRule('A', 'B', 'request', 'normal')).toBe(false);
   });
 });

@@ -28,6 +28,10 @@ import { openDatabase } from '../services/sqlite/DirectDB.js';
 import { parseDateExpression } from '../utils/date-parse.js';
 import { decrypt } from '../services/encryption.js';
 import { getEncryptionKey, encryptionEnabled } from '../services/key-management.js';
+import { readFileSync, existsSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
+import { matchesAutoApproveRule } from '../utils/message-rules.js';
 
 import type { Database, Statement } from 'bun:sqlite';
 
@@ -691,14 +695,23 @@ function handleSendMessage(args: Record<string, any>): { content: Array<{ type: 
 
   const messageId = Number(result.lastInsertRowid);
 
+  let autoApproved = false;
+  if (matchesAutoApproveRule(from, to, messageType, priority)) {
+    cachedPrepare(
+      `UPDATE inter_session_messages SET status = 'approved', approved_at_epoch = ? WHERE id = ?`
+    ).run(nowEpoch, messageId);
+    autoApproved = true;
+  }
+
   const parts = [
     `Message #${messageId} sent to **${to}**.`,
     `Type: ${messageType} | Priority: ${priority} | TTL: ${ttlHours}h`,
     subject ? `Subject: ${subject}` : null,
     parentMessageId ? `Thread: reply to #${parentMessageId}` : null,
     '',
-    'Status: **pending_approval** — awaiting operator approval in the pro dashboard.',
-    'The target session will receive this message via hook injection once approved.'
+    autoApproved
+      ? 'Status: **approved** (auto-approved by matching rule). The target session will receive this message on its next tool use.'
+      : 'Status: **pending_approval** — awaiting operator approval in the pro dashboard.\nThe target session will receive this message via hook injection once approved.'
   ].filter(Boolean);
 
   return { content: [{ type: 'text' as const, text: parts.join('\n') }] };
