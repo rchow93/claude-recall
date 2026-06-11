@@ -16,9 +16,10 @@ export const claudeCodeAdapter: PlatformAdapter = {
     };
   },
   formatOutput(result) {
+    const output: any = { continue: result.continue ?? true, suppressOutput: result.suppressOutput ?? true };
     if (result.hookSpecificOutput) {
-      return { hookSpecificOutput: result.hookSpecificOutput };
+      output.hookSpecificOutput = result.hookSpecificOutput;
     }
-    return { continue: result.continue ?? true, suppressOutput: result.suppressOutput ?? true };
+    return output;
   }
 };

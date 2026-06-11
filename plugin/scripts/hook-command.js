@@ -28,10 +28,11 @@ var claudeCodeAdapter = {
     };
   },
   formatOutput(result) {
+    const output = { continue: result.continue ?? true, suppressOutput: result.suppressOutput ?? true };
     if (result.hookSpecificOutput) {
-      return { hookSpecificOutput: result.hookSpecificOutput };
+      output.hookSpecificOutput = result.hookSpecificOutput;
     }
-    return { continue: result.continue ?? true, suppressOutput: result.suppressOutput ?? true };
+    return output;
   }
 };
 
@@ -2592,6 +2593,45 @@ var observationHandler = {
         }
       }
       logger.debug("HOOK", "Raw observation stored", { toolName });
+      const pendingMsg = db.transaction(() => {
+        const msg = db.prepare(`
+          SELECT id, source_project, message_type, priority, subject, body
+          FROM inter_session_messages
+          WHERE target_project = ? AND status = 'approved'
+          ORDER BY
+            CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
+            created_at_epoch ASC
+          LIMIT 1
+        `).get(project);
+        if (msg) {
+          db.prepare(
+            `UPDATE inter_session_messages SET status = 'delivered', delivered_at_epoch = ? WHERE id = ?`
+          ).run(nowEpoch, msg.id);
+        }
+        return msg;
+      })();
+      if (pendingMsg) {
+        const lines = [
+          "---",
+          `## Inter-Session Message from ${pendingMsg.source_project}`,
+          `**Type:** ${pendingMsg.message_type} | **Priority:** ${pendingMsg.priority} | **Message ID:** ${pendingMsg.id}`,
+          pendingMsg.subject ? `**Subject:** ${pendingMsg.subject}` : null,
+          "",
+          pendingMsg.body,
+          "",
+          "---",
+          `To respond, use the claude-recall MCP tool: reply_message(message_id=${pendingMsg.id}, response="your response here")`
+        ].filter((l) => l !== null).join("\n");
+        logger.info("HOOK", `Delivered inter-session message #${pendingMsg.id} from ${pendingMsg.source_project}`);
+        return {
+          continue: true,
+          suppressOutput: true,
+          hookSpecificOutput: {
+            hookEventName: "PostToolUse",
+            additionalContext: lines
+          }
+        };
+      }
     } finally {
       db.close();
     }

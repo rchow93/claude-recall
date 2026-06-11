@@ -410,6 +410,139 @@ describe('send_message — handler SQL logic', () => {
   });
 });
 
+describe('hook delivery — transaction-based claim + additionalContext format', () => {
+  test('claim atomically selects and marks as delivered', () => {
+    const nowEpoch = 1749800000;
+    const project = 'HookDeliveryTarget';
+
+    // Insert an approved message
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, message_type, priority, subject, body, status, created_at_epoch, ttl_seconds)
+      VALUES ('SenderProject', 'sess-hook', ?, 'request', 'high', 'Deploy now', 'Please deploy v3.0 to production', 'approved', 1749799900, 86400)
+    `).run(project);
+
+    // Simulate the hook's transaction-based claim
+    const pendingMsg = db.transaction(() => {
+      const msg = db.prepare(`
+        SELECT id, source_project, message_type, priority, subject, body
+        FROM inter_session_messages
+        WHERE target_project = ? AND status = 'approved'
+        ORDER BY
+          CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
+          created_at_epoch ASC
+        LIMIT 1
+      `).get(project) as any;
+
+      if (msg) {
+        db.prepare(
+          `UPDATE inter_session_messages SET status = 'delivered', delivered_at_epoch = ? WHERE id = ?`
+        ).run(nowEpoch, msg.id);
+      }
+      return msg;
+    })();
+
+    expect(pendingMsg).not.toBeNull();
+    expect(pendingMsg.source_project).toBe('SenderProject');
+    expect(pendingMsg.subject).toBe('Deploy now');
+    expect(pendingMsg.body).toBe('Please deploy v3.0 to production');
+    expect(pendingMsg.priority).toBe('high');
+
+    // Verify it's marked delivered
+    const row = db.prepare('SELECT status, delivered_at_epoch FROM inter_session_messages WHERE id = ?').get(pendingMsg.id) as any;
+    expect(row.status).toBe('delivered');
+    expect(row.delivered_at_epoch).toBe(nowEpoch);
+  });
+
+  test('second claim returns null (no duplicate delivery)', () => {
+    const project = 'HookDeliveryTarget';
+
+    const secondClaim = db.transaction(() => {
+      return db.prepare(`
+        SELECT id FROM inter_session_messages
+        WHERE target_project = ? AND status = 'approved'
+        LIMIT 1
+      `).get(project);
+    })();
+
+    expect(secondClaim).toBeNull();
+  });
+
+  test('additionalContext format matches expected Markdown structure', () => {
+    const msg = { id: 99, source_project: 'TestSrc', message_type: 'question', priority: 'urgent', subject: 'API Key?', body: 'What is the staging API key?' };
+
+    const lines = [
+      '---',
+      `## Inter-Session Message from ${msg.source_project}`,
+      `**Type:** ${msg.message_type} | **Priority:** ${msg.priority} | **Message ID:** ${msg.id}`,
+      msg.subject ? `**Subject:** ${msg.subject}` : null,
+      '',
+      msg.body,
+      '',
+      '---',
+      `To respond, use the claude-recall MCP tool: reply_message(message_id=${msg.id}, response="your response here")`,
+    ].filter(l => l !== null).join('\n');
+
+    expect(lines).toContain('## Inter-Session Message from TestSrc');
+    expect(lines).toContain('**Type:** question | **Priority:** urgent | **Message ID:** 99');
+    expect(lines).toContain('**Subject:** API Key?');
+    expect(lines).toContain('What is the staging API key?');
+    expect(lines).toContain('reply_message(message_id=99');
+  });
+
+  test('messages without subject omit the subject line', () => {
+    const msg = { id: 100, source_project: 'NoSubj', message_type: 'notify', priority: 'low', subject: null as string | null, body: 'FYI: build passed' };
+
+    const lines = [
+      '---',
+      `## Inter-Session Message from ${msg.source_project}`,
+      `**Type:** ${msg.message_type} | **Priority:** ${msg.priority} | **Message ID:** ${msg.id}`,
+      msg.subject ? `**Subject:** ${msg.subject}` : null,
+      '',
+      msg.body,
+      '',
+      '---',
+      `To respond, use the claude-recall MCP tool: reply_message(message_id=${msg.id}, response="your response here")`,
+    ].filter(l => l !== null).join('\n');
+
+    expect(lines).not.toContain('**Subject:**');
+    expect(lines).toContain('FYI: build passed');
+  });
+});
+
+describe('claude-code adapter — formatOutput merges hookSpecificOutput with continue', () => {
+  test('returns both continue and hookSpecificOutput when present', () => {
+    const result = {
+      continue: true,
+      suppressOutput: true,
+      hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: 'test message' },
+    };
+
+    const output: any = { continue: result.continue ?? true, suppressOutput: result.suppressOutput ?? true };
+    if (result.hookSpecificOutput) {
+      output.hookSpecificOutput = result.hookSpecificOutput;
+    }
+
+    expect(output.continue).toBe(true);
+    expect(output.suppressOutput).toBe(true);
+    expect(output.hookSpecificOutput).toBeDefined();
+    expect(output.hookSpecificOutput.hookEventName).toBe('PostToolUse');
+    expect(output.hookSpecificOutput.additionalContext).toBe('test message');
+  });
+
+  test('returns only continue/suppressOutput when no hookSpecificOutput', () => {
+    const result = { continue: true, suppressOutput: true };
+
+    const output: any = { continue: result.continue ?? true, suppressOutput: result.suppressOutput ?? true };
+    if (result.hookSpecificOutput) {
+      output.hookSpecificOutput = result.hookSpecificOutput;
+    }
+
+    expect(output.continue).toBe(true);
+    expect(output.suppressOutput).toBe(true);
+    expect(output.hookSpecificOutput).toBeUndefined();
+  });
+});
+
 describe('migration 27 — idempotent', () => {
   test('running migrations again does not fail or duplicate', () => {
     const runner = new MigrationRunner(db);
