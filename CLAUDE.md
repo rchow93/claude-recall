@@ -14,13 +14,14 @@ bun test                 # run tests
 ```
 
 ## Key Source Paths
-- `src/servers/mcp-server.ts` — MCP server with all 5 tool definitions (search, timeline, get_observations, forget, __IMPORTANT)
+- `src/servers/mcp-server.ts` — MCP server with 8 tools (search, timeline, get_observations, forget, __IMPORTANT, send_message, check_inbox, reply_message)
 - `src/cli/handlers/context.ts` — SessionStart hook: Recovery Mode + Summary Mode
-- `src/cli/handlers/observation.ts` — PostToolUse hook: relevance scoring, redaction, storage
+- `src/cli/handlers/observation.ts` — PostToolUse hook: relevance scoring, redaction, storage, message delivery + maintenance
 - `src/cli/handlers/session-init.ts` — UserPromptSubmit hook: session creation, prompt storage
 - `src/cli/handlers/summarize.ts` — Stop hook: assistant response extraction
-- `src/services/sqlite/migrations/runner.ts` — Schema migrations (currently through #24)
+- `src/services/sqlite/migrations/runner.ts` — Schema migrations (currently through #27)
 - `src/utils/privacy.ts` — Auto-redaction patterns (8 categories)
+- `src/utils/message-rules.ts` — Auto-approve rule matching with mtime-based file caching
 - `src/cli/handlers/relevance.ts` — Relevance scoring heuristics
 
 ## Database Tables
@@ -30,6 +31,7 @@ bun test                 # run tests
 | `user_prompts` | Full user prompt text (FTS5 indexed) |
 | `sdk_sessions` | Session metadata, status, privacy flags |
 | `consolidated_sessions` | Compressed summaries of old sessions |
+| `inter_session_messages` | Cross-session message bus with priority, TTL, threading |
 
 ## Plugin Structure
 - `.claude-plugin/plugin.json` — Plugin metadata (version must match package.json)

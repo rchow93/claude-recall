@@ -617,7 +617,7 @@ This is count-based, not time-based — a project you haven't touched in weeks r
 
 ## MCP Tools
 
-The MCP server provides five tools following a 3-layer workflow for token-efficient retrieval:
+The MCP server provides eight tools — five for search/retrieval and three for inter-session messaging:
 
 ### `search` — Find observations
 
@@ -685,6 +685,43 @@ Optional `max_length` parameter controls per-field truncation (default 2000, max
 forget(query="api keys", confirm=false)    # preview what would be deleted
 forget(ids=["R:42"], confirm=true)         # delete specific observations
 ```
+
+### `send_message` — Send inter-session message
+
+```
+send_message(to="SmartRouter", message="Deploy v2.3 to staging", from="RecruiterPilot")
+send_message(to="WorkWeek", message="FYI: migration complete", from="MyProject", type="notify", priority="low")
+send_message(to="OtherProject", message="What's the API key format?", from="MyProject", type="question", ttl_hours=4)
+```
+
+Parameters:
+- `to` (required) — target project name
+- `message` (required) — message body
+- `from` (required) — source project name (your project)
+- `subject` — short subject line
+- `type` — `request` (default), `notify`, or `question`
+- `priority` — `low`, `normal` (default), `high`, or `urgent`
+- `ttl_hours` — expiry time in hours (default: 24)
+- `parent_message_id` — for threading replies
+
+Messages start as `pending_approval` and require operator approval (or auto-approve rule match) before delivery. Rate limited to 10 pending messages per source project.
+
+### `check_inbox` — View messages
+
+```
+check_inbox(from="MyProject")
+check_inbox(from="MyProject", status="delivered", limit=5)
+```
+
+Returns incoming and outgoing messages for the specified project.
+
+### `reply_message` — Respond to a message
+
+```
+reply_message(message_id=42, response="Deployed successfully", from="SmartRouter")
+```
+
+Marks the original message as completed and creates a threaded reply.
 
 ### Recommended Workflow
 
@@ -767,6 +804,28 @@ CREATE TABLE consolidated_sessions (
   original_started_at_epoch INTEGER NOT NULL,
   consolidated_at TEXT NOT NULL,
   consolidated_at_epoch INTEGER NOT NULL
+);
+```
+
+**`inter_session_messages`** — Cross-session message bus:
+```sql
+CREATE TABLE inter_session_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_project TEXT NOT NULL,
+  source_session_id TEXT NOT NULL,
+  target_project TEXT NOT NULL,
+  message_type TEXT NOT NULL DEFAULT 'request',   -- request | notify | question | reply
+  priority TEXT NOT NULL DEFAULT 'normal',        -- low | normal | high | urgent
+  subject TEXT,
+  body TEXT NOT NULL,
+  parent_message_id INTEGER,                      -- threading
+  status TEXT NOT NULL DEFAULT 'pending_approval', -- pending_approval | approved | delivered | completed | rejected | expired
+  created_at_epoch INTEGER NOT NULL,
+  approved_at_epoch INTEGER,
+  delivered_at_epoch INTEGER,
+  completed_at_epoch INTEGER,
+  response_body TEXT,
+  ttl_seconds INTEGER DEFAULT 86400               -- 24h default expiry
 );
 ```
 
@@ -933,6 +992,41 @@ sqlite3 ~/.claude-recall/claude-recall.db \
 sqlite3 ~/.claude-recall/claude-recall.db \
   "SELECT COUNT(*) as redacted_count FROM raw_observations WHERE redacted = 1;"
 ```
+
+## Inter-Session Messaging
+
+Claude Code sessions running on different projects can communicate through a shared SQLite message bus. Messages are addressed by project name (stable, human-readable) and delivered via the PostToolUse hook's `additionalContext` injection.
+
+### Message Flow
+
+1. **Session A** calls `send_message(to="ProjectB", message="Deploy v2.3")` → status: `pending_approval`
+2. **Operator** approves in the pro dashboard (or auto-approve rule matches) → status: `approved`
+3. **Session B**'s PostToolUse hook atomically claims the message → status: `delivered`
+4. **Session B** sees the message as injected context and acts on it
+5. **Session B** calls `reply_message(message_id=42, response="Done")` → status: `completed`
+
+### Auto-Approve Rules
+
+Configure trusted project pairs in `~/.claude-recall/message-rules.json`:
+
+```json
+{
+  "auto_approve": [
+    { "from": "SmartRouter", "to": "WorkWeek", "type": "notify" },
+    { "from": "*", "to": "*", "type": "notify", "priority": "low" }
+  ]
+}
+```
+
+Wildcard `*` matches any project. Omitting `type` or `priority` matches all values. Override path: `CLAUDE_RECALL_MESSAGE_RULES` env var.
+
+### Hardening
+
+| Feature | Default | Env Override |
+|---------|---------|-------------|
+| Rate limit | 10 pending per source | `CLAUDE_RECALL_MAX_PENDING_MESSAGES` |
+| TTL expiry | 24h per message | `ttl_hours` param on send |
+| Retention cleanup | 7 days | `CLAUDE_RECALL_MESSAGE_RETENTION_DAYS` |
 
 ## Future Enhancements
 
