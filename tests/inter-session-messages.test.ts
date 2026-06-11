@@ -1298,3 +1298,74 @@ describe('auto-approve — file-based integration', () => {
     expect(matchesAutoApproveRule('A', 'B', 'request', 'normal')).toBe(false);
   });
 });
+
+// --- WOR-143: Rate limiting, TTL expiry, cleanup ---
+
+describe('rate limiting — max pending messages per source', () => {
+  test('counts pending + approved messages per source project', () => {
+    const source = 'RateLimitSource_' + Date.now();
+    const now = Math.floor(Date.now() / 1000);
+
+    for (let i = 0; i < 10; i++) {
+      db.prepare(`
+        INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds)
+        VALUES (?, 'sess-rl', 'SomeTarget', ?, ?, ?, 86400)
+      `).run(source, `msg ${i}`, i < 7 ? 'pending_approval' : 'approved', now);
+    }
+
+    const count = db.prepare(
+      "SELECT COUNT(*) as cnt FROM inter_session_messages WHERE source_project = ? AND status IN ('pending_approval', 'approved')"
+    ).get(source) as { cnt: number };
+    expect(count.cnt).toBe(10);
+  });
+
+  test('does not count completed/rejected/expired toward limit', () => {
+    const source = 'RateLimitDone_' + Date.now();
+    const now = Math.floor(Date.now() / 1000);
+
+    db.prepare(`INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds) VALUES (?, 'sess', 'T', 'a', 'completed', ?, 86400)`).run(source, now);
+    db.prepare(`INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds) VALUES (?, 'sess', 'T', 'b', 'rejected', ?, 86400)`).run(source, now);
+    db.prepare(`INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds) VALUES (?, 'sess', 'T', 'c', 'expired', ?, 86400)`).run(source, now);
+    db.prepare(`INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds) VALUES (?, 'sess', 'T', 'd', 'pending_approval', ?, 86400)`).run(source, now);
+
+    const count = db.prepare(
+      "SELECT COUNT(*) as cnt FROM inter_session_messages WHERE source_project = ? AND status IN ('pending_approval', 'approved')"
+    ).get(source) as { cnt: number };
+    expect(count.cnt).toBe(1);
+  });
+});
+
+describe('message cleanup — delete old terminal messages', () => {
+  test('deletes completed/rejected/expired messages older than retention period', () => {
+    const retentionDays = 7;
+    const cutoff = Math.floor(Date.now() / 1000) - (retentionDays * 86400);
+    const veryOld = cutoff - 86400; // 8 days ago
+    const recent = Math.floor(Date.now() / 1000) - 3600; // 1 hour ago
+
+    const prefix = 'Cleanup_' + Date.now();
+
+    // Old terminal messages — should be cleaned
+    db.prepare(`INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds) VALUES (?, 'sess', 'T', 'old completed', 'completed', ?, 86400)`).run(prefix, veryOld);
+    db.prepare(`INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds) VALUES (?, 'sess', 'T', 'old rejected', 'rejected', ?, 86400)`).run(prefix, veryOld);
+    db.prepare(`INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds) VALUES (?, 'sess', 'T', 'old expired', 'expired', ?, 86400)`).run(prefix, veryOld);
+
+    // Recent terminal message — should NOT be cleaned
+    db.prepare(`INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds) VALUES (?, 'sess', 'T', 'recent completed', 'completed', ?, 86400)`).run(prefix, recent);
+
+    // Old active message — should NOT be cleaned (not terminal status)
+    db.prepare(`INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds) VALUES (?, 'sess', 'T', 'old pending', 'pending_approval', ?, 86400)`).run(prefix, veryOld);
+
+    const cleaned = db.prepare(
+      "DELETE FROM inter_session_messages WHERE source_project = ? AND status IN ('completed', 'rejected', 'expired') AND created_at_epoch < ?"
+    ).run(prefix, cutoff);
+    expect(cleaned.changes).toBe(3);
+
+    // Verify survivors
+    const remaining = db.prepare(
+      "SELECT body FROM inter_session_messages WHERE source_project = ? ORDER BY body"
+    ).all(prefix) as Array<{ body: string }>;
+    expect(remaining.length).toBe(2);
+    expect(remaining.map(r => r.body)).toContain('recent completed');
+    expect(remaining.map(r => r.body)).toContain('old pending');
+  });
+});

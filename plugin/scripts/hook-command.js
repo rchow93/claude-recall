@@ -2591,6 +2591,21 @@ var observationHandler = {
           const deleteCount = Math.max(100, Math.floor(totalRows * CLEANUP_BATCH_PERCENT));
           smartCleanup(db, deleteCount);
         }
+        const msgNow = Math.floor(Date.now() / 1e3);
+        const expired = db.prepare(
+          "UPDATE inter_session_messages SET status = 'expired' WHERE status IN ('pending_approval', 'approved') AND (created_at_epoch + ttl_seconds) < ?"
+        ).run(msgNow);
+        if (expired.changes > 0) {
+          logger.info("HOOK", `Expired ${expired.changes} stale inter-session message(s)`);
+        }
+        const retentionDays = parseInt(process.env.CLAUDE_RECALL_MESSAGE_RETENTION_DAYS ?? "7", 10);
+        const retentionCutoff = msgNow - retentionDays * 86400;
+        const cleaned = db.prepare(
+          "DELETE FROM inter_session_messages WHERE status IN ('completed', 'rejected', 'expired') AND created_at_epoch < ?"
+        ).run(retentionCutoff);
+        if (cleaned.changes > 0) {
+          logger.info("HOOK", `Cleaned up ${cleaned.changes} old inter-session message(s) (>${retentionDays}d)`);
+        }
       }
       logger.debug("HOOK", "Raw observation stored", { toolName });
       const pendingMsg = db.transaction(() => {

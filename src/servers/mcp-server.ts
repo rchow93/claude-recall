@@ -678,6 +678,14 @@ function handleSendMessage(args: Record<string, any>): { content: Array<{ type: 
   const nowEpoch = Math.floor(Date.now() / 1000);
   const ttlSeconds = Math.floor(ttlHours * 3600);
 
+  const maxPending = parseInt(process.env.CLAUDE_RECALL_MAX_PENDING_MESSAGES ?? '10', 10);
+  const pendingCount = cachedPrepare(
+    "SELECT COUNT(*) as cnt FROM inter_session_messages WHERE source_project = ? AND status IN ('pending_approval', 'approved')"
+  ).get(from) as { cnt: number };
+  if (pendingCount.cnt >= maxPending) {
+    return { content: [{ type: 'text' as const, text: `Error: rate limit exceeded. You have ${pendingCount.cnt} pending/approved messages (max ${maxPending}). Wait for existing messages to be delivered or expired before sending more.` }] };
+  }
+
   // Resolve source session ID from most recent active session for this project
   const session = cachedPrepare(
     "SELECT content_session_id FROM sdk_sessions WHERE project = ? ORDER BY started_at_epoch DESC LIMIT 1"
