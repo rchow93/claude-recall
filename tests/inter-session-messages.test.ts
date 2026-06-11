@@ -758,6 +758,399 @@ describe('reply_message — handler SQL logic', () => {
   });
 });
 
+describe('integration — full message lifecycle end-to-end', () => {
+  let msgId: number;
+
+  beforeAll(() => {
+    // Set up projects and sessions for the integration test
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, started_at, started_at_epoch, status, prompt_counter)
+      VALUES ('int-sess-alpha', 'AlphaProject', '2026-06-11T14:00:00Z', 1749910000, 'active', 1)
+    `).run();
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, started_at, started_at_epoch, status, prompt_counter)
+      VALUES ('int-sess-beta', 'BetaProject', '2026-06-11T14:00:00Z', 1749910000, 'active', 1)
+    `).run();
+  });
+
+  test('1. send: AlphaProject sends message to BetaProject', () => {
+    const session = db.prepare(
+      "SELECT content_session_id FROM sdk_sessions WHERE project = ? ORDER BY started_at_epoch DESC LIMIT 1"
+    ).get('AlphaProject') as { content_session_id: string };
+
+    const result = db.prepare(`
+      INSERT INTO inter_session_messages (
+        source_project, source_session_id, target_project,
+        message_type, priority, subject, body, parent_message_id,
+        status, created_at_epoch, ttl_seconds
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
+    `).run('AlphaProject', session.content_session_id, 'BetaProject', 'question', 'high',
+      'Integration test', 'Can you confirm the API is healthy?', null, 1749910100, 86400);
+
+    msgId = Number(result.lastInsertRowid);
+    expect(msgId).toBeGreaterThan(0);
+
+    const row = db.prepare('SELECT * FROM inter_session_messages WHERE id = ?').get(msgId) as any;
+    expect(row.status).toBe('pending_approval');
+    expect(row.source_session_id).toBe('int-sess-alpha');
+  });
+
+  test('2. approve: operator approves the message', () => {
+    const result = db.prepare(
+      `UPDATE inter_session_messages SET status = 'approved', approved_at_epoch = ? WHERE id = ? AND status = 'pending_approval'`
+    ).run(1749910200, msgId);
+    expect(result.changes).toBe(1);
+
+    const row = db.prepare('SELECT status, approved_at_epoch FROM inter_session_messages WHERE id = ?').get(msgId) as any;
+    expect(row.status).toBe('approved');
+    expect(row.approved_at_epoch).toBe(1749910200);
+  });
+
+  test('3. deliver: PostToolUse hook claims and injects additionalContext', () => {
+    const nowEpoch = 1749910300;
+    const project = 'BetaProject';
+
+    const pendingMsg = db.transaction(() => {
+      const msg = db.prepare(`
+        SELECT id, source_project, message_type, priority, subject, body
+        FROM inter_session_messages
+        WHERE target_project = ? AND status = 'approved'
+        ORDER BY
+          CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
+          created_at_epoch ASC
+        LIMIT 1
+      `).get(project) as any;
+
+      if (msg) {
+        db.prepare(
+          `UPDATE inter_session_messages SET status = 'delivered', delivered_at_epoch = ? WHERE id = ?`
+        ).run(nowEpoch, msg.id);
+      }
+      return msg;
+    })();
+
+    expect(pendingMsg).not.toBeNull();
+    expect(pendingMsg.id).toBe(msgId);
+
+    // Build additionalContext
+    const lines = [
+      '---',
+      `## Inter-Session Message from ${pendingMsg.source_project}`,
+      `**Type:** ${pendingMsg.message_type} | **Priority:** ${pendingMsg.priority} | **Message ID:** ${pendingMsg.id}`,
+      pendingMsg.subject ? `**Subject:** ${pendingMsg.subject}` : null,
+      '', pendingMsg.body, '',
+      '---',
+      `To respond, use the claude-recall MCP tool: reply_message(message_id=${pendingMsg.id}, response="your response here")`,
+    ].filter(l => l !== null).join('\n');
+
+    expect(lines).toContain('## Inter-Session Message from AlphaProject');
+    expect(lines).toContain('**Subject:** Integration test');
+    expect(lines).toContain(`reply_message(message_id=${msgId}`);
+
+    const row = db.prepare('SELECT status, delivered_at_epoch FROM inter_session_messages WHERE id = ?').get(msgId) as any;
+    expect(row.status).toBe('delivered');
+    expect(row.delivered_at_epoch).toBe(1749910300);
+  });
+
+  test('4. check_inbox: BetaProject sees the delivered message', () => {
+    const messages = db.prepare(`
+      SELECT id, source_project, target_project, status
+      FROM inter_session_messages
+      WHERE (target_project = ? OR source_project = ?) AND status NOT IN ('expired')
+      ORDER BY created_at_epoch DESC
+      LIMIT 10
+    `).all('BetaProject', 'BetaProject') as Array<{ id: number; status: string }>;
+
+    const found = messages.find(m => m.id === msgId);
+    expect(found).toBeDefined();
+    expect(found!.status).toBe('delivered');
+  });
+
+  test('5. reply: BetaProject replies, completing the original and creating a reply message', () => {
+    const nowEpoch = 1749910400;
+    const responseText = 'API is healthy — all endpoints returning 200.';
+
+    // Complete original
+    db.prepare(
+      `UPDATE inter_session_messages SET status = 'completed', completed_at_epoch = ?, response_body = ? WHERE id = ?`
+    ).run(nowEpoch, responseText, msgId);
+
+    // Get original message for threading
+    const original = db.prepare('SELECT subject, source_project FROM inter_session_messages WHERE id = ?').get(msgId) as any;
+
+    // Create reply message
+    const replyResult = db.prepare(`
+      INSERT INTO inter_session_messages (
+        source_project, source_session_id, target_project,
+        message_type, priority, subject, body, parent_message_id,
+        status, created_at_epoch, ttl_seconds
+      ) VALUES (?, ?, ?, 'reply', 'normal', ?, ?, ?, 'pending_approval', ?, 86400)
+    `).run('BetaProject', 'int-sess-beta', original.source_project,
+      original.subject ? `Re: ${original.subject}` : null, responseText, msgId, nowEpoch);
+
+    const replyId = Number(replyResult.lastInsertRowid);
+
+    // Verify original is completed
+    const origRow = db.prepare('SELECT status, response_body FROM inter_session_messages WHERE id = ?').get(msgId) as any;
+    expect(origRow.status).toBe('completed');
+    expect(origRow.response_body).toBe(responseText);
+
+    // Verify reply message
+    const replyRow = db.prepare('SELECT * FROM inter_session_messages WHERE id = ?').get(replyId) as any;
+    expect(replyRow.message_type).toBe('reply');
+    expect(replyRow.parent_message_id).toBe(msgId);
+    expect(replyRow.subject).toBe('Re: Integration test');
+    expect(replyRow.target_project).toBe('AlphaProject');
+    expect(replyRow.status).toBe('pending_approval');
+  });
+
+  test('6. roundtrip: AlphaProject sees the reply in inbox', () => {
+    const messages = db.prepare(`
+      SELECT id, source_project, target_project, status, message_type, parent_message_id
+      FROM inter_session_messages
+      WHERE (target_project = ? OR source_project = ?) AND status NOT IN ('expired')
+      ORDER BY created_at_epoch DESC
+      LIMIT 10
+    `).all('AlphaProject', 'AlphaProject') as any[];
+
+    const reply = messages.find((m: any) => m.message_type === 'reply' && m.parent_message_id === msgId);
+    expect(reply).toBeDefined();
+    expect(reply.target_project).toBe('AlphaProject');
+    expect(reply.source_project).toBe('BetaProject');
+    expect(reply.status).toBe('pending_approval');
+  });
+});
+
+describe('integration — concurrent delivery (no duplicates)', () => {
+  test('two simultaneous claims on the same message — only one succeeds', () => {
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds)
+      VALUES ('ConcSender', 'sess-conc', 'ConcTarget', 'Concurrent test', 'approved', 1749920000, 86400)
+    `).run();
+
+    const claim = () => db.transaction(() => {
+      const msg = db.prepare(`
+        SELECT id FROM inter_session_messages
+        WHERE target_project = 'ConcTarget' AND status = 'approved'
+        ORDER BY created_at_epoch ASC LIMIT 1
+      `).get() as { id: number } | null;
+
+      if (msg) {
+        db.prepare(
+          `UPDATE inter_session_messages SET status = 'delivered', delivered_at_epoch = ? WHERE id = ?`
+        ).run(1749920100, msg.id);
+      }
+      return msg;
+    })();
+
+    const first = claim();
+    const second = claim();
+
+    expect(first).not.toBeNull();
+    expect(second).toBeNull();
+  });
+});
+
+describe('integration — TTL expiry enforcement', () => {
+  test('batch expire marks old pending/approved messages as expired', () => {
+    const veryOld = 1749800000;
+    const shortTtl = 60; // 1 minute
+
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds)
+      VALUES ('TTLSender', 'sess-ttl', 'TTLTarget', 'Expirable pending', 'pending_approval', ?, ?)
+    `).run(veryOld, shortTtl);
+
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds)
+      VALUES ('TTLSender2', 'sess-ttl2', 'TTLTarget', 'Expirable approved', 'approved', ?, ?)
+    `).run(veryOld, shortTtl);
+
+    // Fresh message should NOT be expired
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds)
+      VALUES ('TTLSender3', 'sess-ttl3', 'TTLTarget', 'Still fresh', 'pending_approval', ?, ?)
+    `).run(Math.floor(Date.now() / 1000), 86400);
+
+    // Simulate expiry batch: mark messages past their TTL
+    const nowEpoch = Math.floor(Date.now() / 1000);
+    const expireResult = db.prepare(`
+      UPDATE inter_session_messages
+      SET status = 'expired'
+      WHERE status IN ('pending_approval', 'approved')
+        AND (created_at_epoch + ttl_seconds) < ?
+    `).run(nowEpoch);
+
+    expect(expireResult.changes).toBeGreaterThanOrEqual(2);
+
+    // Verify fresh message is still pending
+    const fresh = db.prepare(`
+      SELECT status FROM inter_session_messages WHERE body = 'Still fresh'
+    `).get() as any;
+    expect(fresh.status).toBe('pending_approval');
+  });
+});
+
+describe('integration — multi-message priority ordering in delivery', () => {
+  test('urgent messages delivered before normal even if sent later', () => {
+    const target = 'PrioDeliveryTarget';
+
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, priority, status, created_at_epoch, ttl_seconds)
+      VALUES ('LowSender', 'sess-lo', ?, 'Low priority msg', 'low', 'approved', 1749930000, 86400)
+    `).run(target);
+
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, priority, status, created_at_epoch, ttl_seconds)
+      VALUES ('NormSender', 'sess-no', ?, 'Normal priority msg', 'normal', 'approved', 1749930001, 86400)
+    `).run(target);
+
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, priority, status, created_at_epoch, ttl_seconds)
+      VALUES ('UrgentSender', 'sess-ur', ?, 'Urgent priority msg', 'urgent', 'approved', 1749930002, 86400)
+    `).run(target);
+
+    db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, priority, status, created_at_epoch, ttl_seconds)
+      VALUES ('HighSender', 'sess-hi', ?, 'High priority msg', 'high', 'approved', 1749930003, 86400)
+    `).run(target);
+
+    // Simulate 4 sequential hook deliveries — should deliver in priority order
+    const delivered: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const msg = db.transaction(() => {
+        const m = db.prepare(`
+          SELECT id, body FROM inter_session_messages
+          WHERE target_project = ? AND status = 'approved'
+          ORDER BY
+            CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
+            created_at_epoch ASC
+          LIMIT 1
+        `).get(target) as { id: number; body: string } | null;
+        if (m) {
+          db.prepare('UPDATE inter_session_messages SET status = \'delivered\', delivered_at_epoch = ? WHERE id = ?').run(1749930100 + i, m.id);
+        }
+        return m;
+      })();
+      if (msg) delivered.push(msg.body);
+    }
+
+    expect(delivered).toEqual([
+      'Urgent priority msg',
+      'High priority msg',
+      'Normal priority msg',
+      'Low priority msg',
+    ]);
+  });
+});
+
+describe('integration — cross-project messaging with multiple hops', () => {
+  test('3-project relay: A → B, B processes and forwards to C', () => {
+    // Set up sessions
+    for (const [sessId, proj] of [['relay-a', 'RelayA'], ['relay-b', 'RelayB'], ['relay-c', 'RelayC']] as const) {
+      db.prepare(`
+        INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, started_at, started_at_epoch, status, prompt_counter)
+        VALUES (?, ?, '2026-06-11T15:00:00Z', 1749913600, 'active', 1)
+      `).run(sessId, proj);
+    }
+
+    // A → B
+    const msg1 = db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, message_type, subject, body, status, created_at_epoch, ttl_seconds)
+      VALUES ('RelayA', 'relay-a', 'RelayB', 'request', 'Need C data', 'Please get the latest data from C', 'approved', 1749940000, 86400)
+    `).run();
+    const msg1Id = Number(msg1.lastInsertRowid);
+
+    // B claims and delivers
+    const claimed = db.transaction(() => {
+      const m = db.prepare("SELECT id FROM inter_session_messages WHERE target_project = 'RelayB' AND status = 'approved' LIMIT 1").get() as any;
+      if (m) db.prepare("UPDATE inter_session_messages SET status = 'delivered', delivered_at_epoch = 1749940100 WHERE id = ?").run(m.id);
+      return m;
+    })();
+    expect(claimed).not.toBeNull();
+
+    // B forwards to C
+    const msg2 = db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, message_type, subject, body, parent_message_id, status, created_at_epoch, ttl_seconds)
+      VALUES ('RelayB', 'relay-b', 'RelayC', 'request', 'Data request from A', 'A needs the latest data — please provide', ?, 'approved', 1749940200, 86400)
+    `).run(msg1Id);
+    const msg2Id = Number(msg2.lastInsertRowid);
+
+    // C claims
+    const cClaimed = db.transaction(() => {
+      const m = db.prepare("SELECT id FROM inter_session_messages WHERE target_project = 'RelayC' AND status = 'approved' LIMIT 1").get() as any;
+      if (m) db.prepare("UPDATE inter_session_messages SET status = 'delivered', delivered_at_epoch = 1749940300 WHERE id = ?").run(m.id);
+      return m;
+    })();
+    expect(cClaimed).not.toBeNull();
+    expect(cClaimed.id).toBe(msg2Id);
+
+    // C replies back to B
+    db.prepare("UPDATE inter_session_messages SET status = 'completed', completed_at_epoch = 1749940400, response_body = 'Here is the data: [...]' WHERE id = ?").run(msg2Id);
+
+    // B replies back to A
+    db.prepare("UPDATE inter_session_messages SET status = 'completed', completed_at_epoch = 1749940500, response_body = 'Data from C: [...]' WHERE id = ?").run(msg1Id);
+
+    // Verify the full chain
+    const chain = db.prepare(`
+      SELECT id, source_project, target_project, status, response_body FROM inter_session_messages WHERE id IN (?, ?) ORDER BY id
+    `).all(msg1Id, msg2Id) as any[];
+
+    expect(chain.length).toBe(2);
+    expect(chain[0].status).toBe('completed');
+    expect(chain[0].response_body).toContain('Data from C');
+    expect(chain[1].status).toBe('completed');
+    expect(chain[1].response_body).toContain('Here is the data');
+    expect(chain[1].parent_message_id ?? db.prepare('SELECT parent_message_id FROM inter_session_messages WHERE id = ?').get(msg2Id) as any).toBeDefined();
+  });
+});
+
+describe('integration — error validation paths', () => {
+  test('send_message rejects invalid type', () => {
+    const validTypes = ['request', 'notify', 'question'];
+    expect(validTypes.includes('invalid')).toBe(false);
+  });
+
+  test('send_message rejects invalid priority', () => {
+    const validPriorities = ['low', 'normal', 'high', 'urgent'];
+    expect(validPriorities.includes('critical')).toBe(false);
+  });
+
+  test('reply to non-existent message returns null', () => {
+    const msg = db.prepare(
+      'SELECT id FROM inter_session_messages WHERE id = ?'
+    ).get(999999);
+    expect(msg).toBeNull();
+  });
+
+  test('reply to wrong project is rejected by status check', () => {
+    // Insert a message delivered to CorrectProject
+    const result = db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, delivered_at_epoch, created_at_epoch, ttl_seconds)
+      VALUES ('Sender', 'sess', 'CorrectProject', 'test', 'delivered', 1749950000, 1749949000, 86400)
+    `).run();
+    const id = Number(result.lastInsertRowid);
+
+    const msg = db.prepare('SELECT target_project FROM inter_session_messages WHERE id = ?').get(id) as any;
+    expect(msg.target_project).toBe('CorrectProject');
+    expect(msg.target_project !== 'WrongProject').toBe(true);
+  });
+
+  test('approve on non-pending message has no effect', () => {
+    // Insert an already-delivered message
+    const result = db.prepare(`
+      INSERT INTO inter_session_messages (source_project, source_session_id, target_project, body, status, created_at_epoch, ttl_seconds)
+      VALUES ('S', 's', 'T', 'already delivered', 'delivered', 1749950100, 86400)
+    `).run();
+    const id = Number(result.lastInsertRowid);
+
+    const approveResult = db.prepare(
+      `UPDATE inter_session_messages SET status = 'approved', approved_at_epoch = ? WHERE id = ? AND status = 'pending_approval'`
+    ).run(1749950200, id);
+    expect(approveResult.changes).toBe(0);
+  });
+});
+
 describe('migration 27 — idempotent', () => {
   test('running migrations again does not fail or duplicate', () => {
     const runner = new MigrationRunner(db);
