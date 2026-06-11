@@ -22397,6 +22397,51 @@ Call forget() again with confirm=true to delete.`
     }]
   };
 }
+function handleSendMessage(args) {
+  const to = args.to;
+  const message = args.message;
+  const from = args.from;
+  const subject = args.subject ?? null;
+  const messageType = args.type ?? "request";
+  const priority = args.priority ?? "normal";
+  const ttlHours = args.ttl_hours ?? 24;
+  const parentMessageId = args.parent_message_id ?? null;
+  if (!to || !message || !from) {
+    return { content: [{ type: "text", text: 'Error: "to", "message", and "from" are required parameters.' }] };
+  }
+  const validTypes = ["request", "notify", "question"];
+  if (!validTypes.includes(messageType)) {
+    return { content: [{ type: "text", text: `Error: type must be one of: ${validTypes.join(", ")}` }] };
+  }
+  const validPriorities = ["low", "normal", "high", "urgent"];
+  if (!validPriorities.includes(priority)) {
+    return { content: [{ type: "text", text: `Error: priority must be one of: ${validPriorities.join(", ")}` }] };
+  }
+  const nowEpoch = Math.floor(Date.now() / 1e3);
+  const ttlSeconds = Math.floor(ttlHours * 3600);
+  const session = cachedPrepare(
+    "SELECT content_session_id FROM sdk_sessions WHERE project = ? ORDER BY started_at_epoch DESC LIMIT 1"
+  ).get(from);
+  const sourceSessionId = session?.content_session_id ?? "unknown";
+  const result = cachedPrepare(`
+    INSERT INTO inter_session_messages (
+      source_project, source_session_id, target_project,
+      message_type, priority, subject, body, parent_message_id,
+      status, created_at_epoch, ttl_seconds
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
+  `).run(from, sourceSessionId, to, messageType, priority, subject, message, parentMessageId, nowEpoch, ttlSeconds);
+  const messageId = Number(result.lastInsertRowid);
+  const parts = [
+    `Message #${messageId} sent to **${to}**.`,
+    `Type: ${messageType} | Priority: ${priority} | TTL: ${ttlHours}h`,
+    subject ? `Subject: ${subject}` : null,
+    parentMessageId ? `Thread: reply to #${parentMessageId}` : null,
+    "",
+    "Status: **pending_approval** \u2014 awaiting operator approval in the pro dashboard.",
+    "The target session will receive this message via hook injection once approved."
+  ].filter(Boolean);
+  return { content: [{ type: "text", text: parts.join("\n") }] };
+}
 var tools = [
   {
     name: "__IMPORTANT",
@@ -22494,6 +22539,26 @@ Prefix R: = raw observations, L: = legacy observations, C: = consolidated sessio
       additionalProperties: true
     },
     handler: async (args) => handleGetObservations(args)
+  },
+  {
+    name: "send_message",
+    description: "Send a message to another project's Claude Code session. Messages require operator approval in the pro dashboard before delivery. The target session receives the message via hook injection.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: 'Target project name (e.g. "SmartRouter", "RecruiterPilot")' },
+        message: { type: "string", description: "Message body" },
+        from: { type: "string", description: "Source project name (your current project)" },
+        subject: { type: "string", description: "Short subject line (optional)" },
+        type: { type: "string", enum: ["request", "notify", "question"], description: "Message type: request (action needed), notify (FYI), question (answer needed). Default: request" },
+        priority: { type: "string", enum: ["low", "normal", "high", "urgent"], description: "Priority level. Default: normal" },
+        ttl_hours: { type: "number", description: "Hours until message expires. Default: 24" },
+        parent_message_id: { type: "number", description: "ID of message being replied to (for threading)" }
+      },
+      required: ["to", "message", "from"],
+      additionalProperties: false
+    },
+    handler: async (args) => handleSendMessage(args)
   },
   {
     name: "forget",

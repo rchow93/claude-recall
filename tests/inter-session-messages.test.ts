@@ -316,6 +316,100 @@ describe('inter_session_messages — priority ordering', () => {
   });
 });
 
+describe('send_message — handler SQL logic', () => {
+  test('insert with defaults matches handler behavior', () => {
+    const from = 'TestSender';
+    const to = 'TestReceiver';
+    const message = 'Please review PR #42';
+    const messageType = 'request';
+    const priority = 'normal';
+    const subject = null;
+    const parentMessageId = null;
+    const nowEpoch = 1749700000;
+    const ttlSeconds = 86400;
+
+    // Create a session so handler can resolve source_session_id
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, started_at, started_at_epoch, status, prompt_counter)
+      VALUES ('send-test-sess', ?, '2026-06-11T10:00:00Z', 1749700000, 'active', 1)
+    `).run(from);
+
+    const session = db.prepare(
+      "SELECT content_session_id FROM sdk_sessions WHERE project = ? ORDER BY started_at_epoch DESC LIMIT 1"
+    ).get(from) as { content_session_id: string } | null;
+    const sourceSessionId = session?.content_session_id ?? 'unknown';
+
+    const result = db.prepare(`
+      INSERT INTO inter_session_messages (
+        source_project, source_session_id, target_project,
+        message_type, priority, subject, body, parent_message_id,
+        status, created_at_epoch, ttl_seconds
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
+    `).run(from, sourceSessionId, to, messageType, priority, subject, message, parentMessageId, nowEpoch, ttlSeconds);
+
+    const id = Number(result.lastInsertRowid);
+    expect(id).toBeGreaterThan(0);
+
+    const row = db.prepare('SELECT * FROM inter_session_messages WHERE id = ?').get(id) as any;
+    expect(row.source_project).toBe('TestSender');
+    expect(row.source_session_id).toBe('send-test-sess');
+    expect(row.target_project).toBe('TestReceiver');
+    expect(row.body).toBe('Please review PR #42');
+    expect(row.message_type).toBe('request');
+    expect(row.priority).toBe('normal');
+    expect(row.status).toBe('pending_approval');
+    expect(row.ttl_seconds).toBe(86400);
+    expect(row.subject).toBeNull();
+    expect(row.parent_message_id).toBeNull();
+  });
+
+  test('insert with all optional fields', () => {
+    const result = db.prepare(`
+      INSERT INTO inter_session_messages (
+        source_project, source_session_id, target_project,
+        message_type, priority, subject, body, parent_message_id,
+        status, created_at_epoch, ttl_seconds
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
+    `).run('ProjectA', 'sess-full', 'ProjectB', 'question', 'urgent', 'Deployment ETA?', 'When will v3 be deployed?', null, 1749700100, 7200);
+
+    const row = db.prepare('SELECT * FROM inter_session_messages WHERE id = ?').get(Number(result.lastInsertRowid)) as any;
+    expect(row.message_type).toBe('question');
+    expect(row.priority).toBe('urgent');
+    expect(row.subject).toBe('Deployment ETA?');
+    expect(row.ttl_seconds).toBe(7200);
+  });
+
+  test('insert with threading (parent_message_id)', () => {
+    const parent = db.prepare(`
+      INSERT INTO inter_session_messages (
+        source_project, source_session_id, target_project, body,
+        status, created_at_epoch, ttl_seconds
+      ) VALUES ('X', 'sess', 'Y', 'Original', 'pending_approval', 1749700200, 86400)
+    `).run();
+    const parentId = Number(parent.lastInsertRowid);
+
+    const reply = db.prepare(`
+      INSERT INTO inter_session_messages (
+        source_project, source_session_id, target_project,
+        message_type, priority, subject, body, parent_message_id,
+        status, created_at_epoch, ttl_seconds
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
+    `).run('Y', 'sess-reply', 'X', 'request', 'normal', null, 'Follow-up reply', parentId, 1749700300, 86400);
+
+    const row = db.prepare('SELECT * FROM inter_session_messages WHERE id = ?').get(Number(reply.lastInsertRowid)) as any;
+    expect(row.parent_message_id).toBe(parentId);
+    expect(row.body).toBe('Follow-up reply');
+  });
+
+  test('source_session_id falls back to unknown when no session exists', () => {
+    const session = db.prepare(
+      "SELECT content_session_id FROM sdk_sessions WHERE project = ? ORDER BY started_at_epoch DESC LIMIT 1"
+    ).get('NonExistentProject99') as { content_session_id: string } | null;
+    const sourceSessionId = session?.content_session_id ?? 'unknown';
+    expect(sourceSessionId).toBe('unknown');
+  });
+});
+
 describe('migration 27 — idempotent', () => {
   test('running migrations again does not fail or duplicate', () => {
     const runner = new MigrationRunner(db);
