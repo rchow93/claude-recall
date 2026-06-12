@@ -385,6 +385,19 @@ export const observationHandler: EventHandler = {
 
         logger.info('HOOK', `Delivered inter-session message #${pendingMsg.id} from ${pendingMsg.source_project}`);
 
+        const banner = [
+          '',
+          '\x1b[36m╔══════════════════════════════════════════════════════════════╗\x1b[0m',
+          `\x1b[36m║\x1b[0m  \x1b[1m📨 Inter-Session Message Delivered\x1b[0m`,
+          `\x1b[36m║\x1b[0m  From: \x1b[33m${pendingMsg.source_project}\x1b[0m  →  To: \x1b[33m${project}\x1b[0m`,
+          `\x1b[36m║\x1b[0m  Type: ${pendingMsg.message_type}  |  Priority: ${pendingMsg.priority}  |  ID: #${pendingMsg.id}`,
+          pendingMsg.subject ? `\x1b[36m║\x1b[0m  Subject: \x1b[1m${pendingMsg.subject}\x1b[0m` : null,
+          `\x1b[36m║\x1b[0m  Body: ${pendingMsg.body.length > 120 ? pendingMsg.body.slice(0, 120) + '…' : pendingMsg.body}`,
+          '\x1b[36m╚══════════════════════════════════════════════════════════════╝\x1b[0m',
+          '',
+        ].filter(l => l !== null).join('\n');
+        process.stderr.write(banner);
+
         return {
           continue: true,
           suppressOutput: true,

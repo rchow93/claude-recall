@@ -2883,6 +2883,18 @@ var observationHandler = {
           `To respond, use the claude-recall MCP tool: reply_message(message_id=${pendingMsg.id}, response="your response here")`
         ].filter((l) => l !== null).join("\n");
         logger.info("HOOK", `Delivered inter-session message #${pendingMsg.id} from ${pendingMsg.source_project}`);
+        const banner = [
+          "",
+          "\x1B[36m\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\x1B[0m",
+          `\x1B[36m\u2551\x1B[0m  \x1B[1m\u{1F4E8} Inter-Session Message Delivered\x1B[0m`,
+          `\x1B[36m\u2551\x1B[0m  From: \x1B[33m${pendingMsg.source_project}\x1B[0m  \u2192  To: \x1B[33m${project}\x1B[0m`,
+          `\x1B[36m\u2551\x1B[0m  Type: ${pendingMsg.message_type}  |  Priority: ${pendingMsg.priority}  |  ID: #${pendingMsg.id}`,
+          pendingMsg.subject ? `\x1B[36m\u2551\x1B[0m  Subject: \x1B[1m${pendingMsg.subject}\x1B[0m` : null,
+          `\x1B[36m\u2551\x1B[0m  Body: ${pendingMsg.body.length > 120 ? pendingMsg.body.slice(0, 120) + "\u2026" : pendingMsg.body}`,
+          "\x1B[36m\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D\x1B[0m",
+          ""
+        ].filter((l) => l !== null).join("\n");
+        process.stderr.write(banner);
         return {
           continue: true,
           suppressOutput: true,
