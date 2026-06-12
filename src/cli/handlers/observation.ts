@@ -164,9 +164,9 @@ export const observationHandler: EventHandler = {
          VALUES (?, ?, ?, ?, ?, 'active')`,
         [sessionId, project, projectId, now.toISOString(), nowEpoch]
       );
-      // Backfill project_id on existing sessions that don't have it
+      // Backfill project_id and reactivate resumed sessions
       db.run(
-        'UPDATE sdk_sessions SET project_id = COALESCE(project_id, ?) WHERE content_session_id = ?',
+        "UPDATE sdk_sessions SET project_id = COALESCE(project_id, ?), status = 'active' WHERE content_session_id = ?",
         [projectId, sessionId]
       );
 

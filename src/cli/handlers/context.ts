@@ -468,6 +468,14 @@ You have access to claude-recall MCP tools for searching past conversation histo
 - Full assistant responses (up to 10K chars each)
 - All tool calls with inputs and outputs
 - Session metadata and timestamps
+
+### Inter-Session Messaging
+Send messages to other Claude Code sessions across projects. Messages are delivered via hook injection.
+- **send_message(to, message, from)** → Send to another project's session. Requires operator approval before delivery.
+- **check_inbox(from)** → View incoming and outgoing messages for your project.
+- **reply_message(message_id, response, from)** → Reply to a delivered message. Marks it completed and sends a reply back.
+- The \`from\` parameter should be your current project name (directory basename).
+- Messages are delivered automatically when the target session makes its next tool call.
 <!-- end-claude-recall-instructions -->`;
 
 function ensureClaudeMdInstructions(): void {
@@ -481,7 +489,18 @@ function ensureClaudeMdInstructions(): void {
 
     if (existsSync(claudeMdPath)) {
       const content = readFileSync(claudeMdPath, 'utf-8');
-      if (content.includes(CLAUDE_MD_MARKER)) return;
+      if (content.includes(CLAUDE_MD_MARKER)) {
+        // Replace existing block with latest version
+        const updated = content.replace(
+          /<!-- claude-recall-instructions -->[\s\S]*?<!-- end-claude-recall-instructions -->/,
+          CLAUDE_MD_BLOCK.trim()
+        );
+        if (updated !== content) {
+          writeFileSync(claudeMdPath, updated, 'utf-8');
+          logger.debug('HOOK', 'Updated recall instructions in ~/.claude/CLAUDE.md');
+        }
+        return;
+      }
     }
 
     writeFileSync(claudeMdPath, (existsSync(claudeMdPath) ? readFileSync(claudeMdPath, 'utf-8') : '') + CLAUDE_MD_BLOCK, 'utf-8');
