@@ -51,6 +51,8 @@ describe('migration 27 — inter_session_messages table', () => {
     expect(colMap.has('response_body')).toBe(true);
     expect(colMap.has('encrypted')).toBe(true);
     expect(colMap.has('ttl_seconds')).toBe(true);
+    expect(colMap.has('source_project_id')).toBe(true);
+    expect(colMap.has('target_project_id')).toBe(true);
 
     expect(colMap.get('source_project')!.notnull).toBe(1);
     expect(colMap.get('source_session_id')!.notnull).toBe(1);
@@ -65,7 +67,7 @@ describe('migration 27 — inter_session_messages table', () => {
     expect(colMap.get('ttl_seconds')!.dflt_value).toBe('86400');
   });
 
-  test('all 4 indexes exist', () => {
+  test('all indexes exist', () => {
     const indexes = db.prepare(
       "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='inter_session_messages' AND name LIKE 'idx_ism_%'"
     ).all() as Array<{ name: string }>;
@@ -75,6 +77,7 @@ describe('migration 27 — inter_session_messages table', () => {
       'idx_ism_created',
       'idx_ism_parent',
       'idx_ism_source',
+      'idx_ism_target_project_id',
       'idx_ism_target_status',
     ]);
   });

@@ -21142,6 +21142,7 @@ var MigrationRunner = class {
     this.addEncryptionColumns();
     this.createInterSessionMessagesTable();
     this.dropFtsTrigersForFieldEncryption();
+    this.addProjectIdColumns();
   }
   /**
    * Initialize database schema using migrations (migration004)
@@ -21837,6 +21838,31 @@ var MigrationRunner = class {
     logger.debug("DB", "Dropped FTS5 auto-sync triggers for field-level encryption (migration 28)");
     this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(28, (/* @__PURE__ */ new Date()).toISOString());
   }
+  /**
+   * Add canonical project_id columns (migration 29)
+   *
+   * project_id is resolved from git remote origin (e.g. "askqai/claude-recall")
+   * or absolute path for non-git directories. Enables reliable message routing
+   * independent of directory basename.
+   */
+  addProjectIdColumns() {
+    const applied = this.db.prepare("SELECT 1 FROM schema_versions WHERE version = 29").get();
+    if (applied) return;
+    const sessionCols = this.db.prepare("PRAGMA table_info(sdk_sessions)").all();
+    if (!sessionCols.some((c) => c.name === "project_id")) {
+      this.db.run("ALTER TABLE sdk_sessions ADD COLUMN project_id TEXT");
+      this.db.run("CREATE INDEX IF NOT EXISTS idx_sdk_sessions_project_id ON sdk_sessions(project_id)");
+      logger.debug("DB", "Added project_id column to sdk_sessions");
+    }
+    const msgCols = this.db.prepare("PRAGMA table_info(inter_session_messages)").all();
+    if (!msgCols.some((c) => c.name === "source_project_id")) {
+      this.db.run("ALTER TABLE inter_session_messages ADD COLUMN source_project_id TEXT");
+      this.db.run("ALTER TABLE inter_session_messages ADD COLUMN target_project_id TEXT");
+      this.db.run("CREATE INDEX IF NOT EXISTS idx_ism_target_project_id ON inter_session_messages(target_project_id, status)");
+      logger.debug("DB", "Added project_id columns to inter_session_messages");
+    }
+    this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(29, (/* @__PURE__ */ new Date()).toISOString());
+  }
 };
 
 // src/services/sqlite/DirectDB.ts
@@ -22464,6 +22490,21 @@ Call forget() again with confirm=true to delete.`
     }]
   };
 }
+function lookupProjectId(displayNameOrId) {
+  const directMatch = cachedPrepare(
+    "SELECT project, project_id FROM sdk_sessions WHERE project_id = ? ORDER BY started_at_epoch DESC LIMIT 1"
+  ).get(displayNameOrId);
+  if (directMatch) {
+    return { projectId: directMatch.project_id, displayName: directMatch.project };
+  }
+  const session = cachedPrepare(
+    "SELECT project, project_id FROM sdk_sessions WHERE project = ? ORDER BY started_at_epoch DESC LIMIT 1"
+  ).get(displayNameOrId);
+  if (session?.project_id) {
+    return { projectId: session.project_id, displayName: session.project };
+  }
+  return { projectId: displayNameOrId, displayName: displayNameOrId };
+}
 function handleSendMessage(args) {
   const to = args.to;
   const message = args.message;
@@ -22486,24 +22527,27 @@ function handleSendMessage(args) {
   }
   const nowEpoch = Math.floor(Date.now() / 1e3);
   const ttlSeconds = Math.floor(ttlHours * 3600);
+  const source = lookupProjectId(from);
+  const target = lookupProjectId(to);
   const maxPending = parseInt(process.env.CLAUDE_RECALL_MAX_PENDING_MESSAGES ?? "10", 10);
   const pendingCount = cachedPrepare(
-    "SELECT COUNT(*) as cnt FROM inter_session_messages WHERE source_project = ? AND status IN ('pending_approval', 'approved')"
-  ).get(from);
+    "SELECT COUNT(*) as cnt FROM inter_session_messages WHERE (source_project_id = ? OR source_project = ?) AND status IN ('pending_approval', 'approved')"
+  ).get(source.projectId, from);
   if (pendingCount.cnt >= maxPending) {
     return { content: [{ type: "text", text: `Error: rate limit exceeded. You have ${pendingCount.cnt} pending/approved messages (max ${maxPending}). Wait for existing messages to be delivered or expired before sending more.` }] };
   }
   const session = cachedPrepare(
-    "SELECT content_session_id FROM sdk_sessions WHERE project = ? ORDER BY started_at_epoch DESC LIMIT 1"
-  ).get(from);
+    "SELECT content_session_id FROM sdk_sessions WHERE project = ? OR project_id = ? ORDER BY started_at_epoch DESC LIMIT 1"
+  ).get(from, source.projectId);
   const sourceSessionId = session?.content_session_id ?? "unknown";
   const result = cachedPrepare(`
     INSERT INTO inter_session_messages (
-      source_project, source_session_id, target_project,
+      source_project, source_project_id, source_session_id,
+      target_project, target_project_id,
       message_type, priority, subject, body, parent_message_id,
       status, created_at_epoch, ttl_seconds
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
-  `).run(from, sourceSessionId, to, messageType, priority, subject, message, parentMessageId, nowEpoch, ttlSeconds);
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)
+  `).run(source.displayName, source.projectId, sourceSessionId, target.displayName, target.projectId, messageType, priority, subject, message, parentMessageId, nowEpoch, ttlSeconds);
   const messageId = Number(result.lastInsertRowid);
   let autoApproved = false;
   if (matchesAutoApproveRule(from, to, messageType, priority)) {
@@ -22529,6 +22573,7 @@ function handleCheckInbox(args) {
   if (!from) {
     return { content: [{ type: "text", text: 'Error: "from" (your project name) is required.' }] };
   }
+  const resolved = lookupProjectId(from);
   const validStatuses = ["pending_approval", "approved", "delivered", "completed", "rejected", "expired"];
   if (statusFilter && !validStatuses.includes(statusFilter)) {
     return { content: [{ type: "text", text: `Error: status must be one of: ${validStatuses.join(", ")}` }] };
@@ -22540,21 +22585,21 @@ function handleCheckInbox(args) {
       SELECT id, source_project, target_project, message_type, priority, subject, body,
              status, created_at_epoch, delivered_at_epoch, completed_at_epoch, response_body, parent_message_id
       FROM inter_session_messages
-      WHERE (target_project = ? OR source_project = ?) AND status = ?
+      WHERE (target_project = ? OR target_project_id = ? OR source_project = ? OR source_project_id = ?) AND status = ?
       ORDER BY created_at_epoch DESC
       LIMIT ?
     `;
-    params = [from, from, statusFilter, limit];
+    params = [from, resolved.projectId, from, resolved.projectId, statusFilter, limit];
   } else {
     query = `
       SELECT id, source_project, target_project, message_type, priority, subject, body,
              status, created_at_epoch, delivered_at_epoch, completed_at_epoch, response_body, parent_message_id
       FROM inter_session_messages
-      WHERE (target_project = ? OR source_project = ?) AND status NOT IN ('expired')
+      WHERE (target_project = ? OR target_project_id = ? OR source_project = ? OR source_project_id = ?) AND status NOT IN ('expired')
       ORDER BY created_at_epoch DESC
       LIMIT ?
     `;
-    params = [from, from, limit];
+    params = [from, resolved.projectId, from, resolved.projectId, limit];
   }
   const messages = cachedPrepare(query).all(...params);
   if (messages.length === 0) {
@@ -22588,13 +22633,15 @@ function handleReplyMessage(args) {
   if (!messageId || !response || !from) {
     return { content: [{ type: "text", text: 'Error: "message_id", "response", and "from" (your project name) are required.' }] };
   }
+  const resolved = lookupProjectId(from);
   const msg = cachedPrepare(
-    "SELECT id, target_project, source_project, status, subject FROM inter_session_messages WHERE id = ?"
+    "SELECT id, target_project, target_project_id, source_project, source_project_id, status, subject FROM inter_session_messages WHERE id = ?"
   ).get(messageId);
   if (!msg) {
     return { content: [{ type: "text", text: `Error: message #${messageId} not found.` }] };
   }
-  if (msg.target_project !== from) {
+  const ownershipMatch = msg.target_project_id && msg.target_project_id === resolved.projectId || msg.target_project === from;
+  if (!ownershipMatch) {
     return { content: [{ type: "text", text: `Error: message #${messageId} was sent to "${msg.target_project}", not "${from}". You can only reply to messages addressed to your project.` }] };
   }
   if (msg.status !== "delivered") {
@@ -22605,16 +22652,17 @@ function handleReplyMessage(args) {
     `UPDATE inter_session_messages SET status = 'completed', completed_at_epoch = ?, response_body = ? WHERE id = ?`
   ).run(nowEpoch, response, messageId);
   const session = cachedPrepare(
-    "SELECT content_session_id FROM sdk_sessions WHERE project = ? ORDER BY started_at_epoch DESC LIMIT 1"
-  ).get(from);
+    "SELECT content_session_id FROM sdk_sessions WHERE project = ? OR project_id = ? ORDER BY started_at_epoch DESC LIMIT 1"
+  ).get(from, resolved.projectId);
   const sourceSessionId = session?.content_session_id ?? "unknown";
   const replyResult = cachedPrepare(`
     INSERT INTO inter_session_messages (
-      source_project, source_session_id, target_project,
+      source_project, source_project_id, source_session_id,
+      target_project, target_project_id,
       message_type, priority, subject, body, parent_message_id,
       status, created_at_epoch, ttl_seconds
-    ) VALUES (?, ?, ?, 'reply', 'normal', ?, ?, ?, 'pending_approval', ?, 86400)
-  `).run(from, sourceSessionId, msg.source_project, msg.subject ? `Re: ${msg.subject}` : null, response, messageId, nowEpoch);
+    ) VALUES (?, ?, ?, ?, ?, 'reply', 'normal', ?, ?, ?, 'pending_approval', ?, 86400)
+  `).run(resolved.displayName, resolved.projectId, sourceSessionId, msg.source_project, msg.source_project_id, msg.subject ? `Re: ${msg.subject}` : null, response, messageId, nowEpoch);
   const replyId = Number(replyResult.lastInsertRowid);
   const parts = [
     `Message #${messageId} marked as **completed** with your response.`,

@@ -9,6 +9,7 @@
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
 import { openDatabase } from '../../services/sqlite/DirectDB.js';
 import { getProjectName } from '../../utils/project-name.js';
+import { resolveProjectId } from '../../utils/project-identity.js';
 import { logger } from '../../utils/logger.js';
 import { isPrivatePrompt } from '../../utils/privacy.js';
 import { encrypt } from '../../services/encryption.js';
@@ -23,6 +24,7 @@ export const sessionInitHandler: EventHandler = {
     }
 
     const project = getProjectName(cwd);
+    const projectId = resolveProjectId(cwd);
     const now = new Date();
     const nowIso = now.toISOString();
     const nowEpoch = Math.floor(now.getTime() / 1000);
@@ -35,15 +37,15 @@ export const sessionInitHandler: EventHandler = {
       const initSession = db.transaction(() => {
         // Create session if it doesn't exist
         db.run(
-          `INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, started_at, started_at_epoch, status, prompt_counter)
-           VALUES (?, ?, ?, ?, 'active', 0)`,
-          [sessionId, project, nowIso, nowEpoch]
+          `INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, project_id, started_at, started_at_epoch, status, prompt_counter)
+           VALUES (?, ?, ?, ?, ?, 'active', 0)`,
+          [sessionId, project, projectId, nowIso, nowEpoch]
         );
 
-        // Set or clear privacy suppression flag
+        // Set or clear privacy suppression flag; always update project_id (may have been missing on earlier insert)
         db.run(
-          'UPDATE sdk_sessions SET prompt_counter = prompt_counter + 1, privacy_suppressed = ? WHERE content_session_id = ?',
-          [isPrivate ? 1 : 0, sessionId]
+          'UPDATE sdk_sessions SET prompt_counter = prompt_counter + 1, privacy_suppressed = ?, project_id = COALESCE(project_id, ?) WHERE content_session_id = ?',
+          [isPrivate ? 1 : 0, projectId, sessionId]
         );
         const session = db.prepare(
           'SELECT id, prompt_counter FROM sdk_sessions WHERE content_session_id = ?'

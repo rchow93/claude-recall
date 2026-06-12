@@ -39,6 +39,7 @@ export class MigrationRunner {
     this.addEncryptionColumns();
     this.createInterSessionMessagesTable();
     this.dropFtsTrigersForFieldEncryption();
+    this.addProjectIdColumns();
   }
 
   /**
@@ -939,5 +940,34 @@ export class MigrationRunner {
     logger.debug('DB', 'Dropped FTS5 auto-sync triggers for field-level encryption (migration 28)');
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(28, new Date().toISOString());
+  }
+
+  /**
+   * Add canonical project_id columns (migration 29)
+   *
+   * project_id is resolved from git remote origin (e.g. "askqai/claude-recall")
+   * or absolute path for non-git directories. Enables reliable message routing
+   * independent of directory basename.
+   */
+  private addProjectIdColumns(): void {
+    const applied = this.db.prepare('SELECT 1 FROM schema_versions WHERE version = 29').get();
+    if (applied) return;
+
+    const sessionCols = this.db.prepare('PRAGMA table_info(sdk_sessions)').all() as TableColumnInfo[];
+    if (!sessionCols.some(c => c.name === 'project_id')) {
+      this.db.run('ALTER TABLE sdk_sessions ADD COLUMN project_id TEXT');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_sdk_sessions_project_id ON sdk_sessions(project_id)');
+      logger.debug('DB', 'Added project_id column to sdk_sessions');
+    }
+
+    const msgCols = this.db.prepare('PRAGMA table_info(inter_session_messages)').all() as TableColumnInfo[];
+    if (!msgCols.some(c => c.name === 'source_project_id')) {
+      this.db.run('ALTER TABLE inter_session_messages ADD COLUMN source_project_id TEXT');
+      this.db.run('ALTER TABLE inter_session_messages ADD COLUMN target_project_id TEXT');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_ism_target_project_id ON inter_session_messages(target_project_id, status)');
+      logger.debug('DB', 'Added project_id columns to inter_session_messages');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(29, new Date().toISOString());
   }
 }

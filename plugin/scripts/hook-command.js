@@ -598,6 +598,7 @@ var MigrationRunner = class {
     this.addEncryptionColumns();
     this.createInterSessionMessagesTable();
     this.dropFtsTrigersForFieldEncryption();
+    this.addProjectIdColumns();
   }
   /**
    * Initialize database schema using migrations (migration004)
@@ -1292,6 +1293,31 @@ var MigrationRunner = class {
     this.db.run("DROP TRIGGER IF EXISTS user_prompts_au");
     logger.debug("DB", "Dropped FTS5 auto-sync triggers for field-level encryption (migration 28)");
     this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(28, (/* @__PURE__ */ new Date()).toISOString());
+  }
+  /**
+   * Add canonical project_id columns (migration 29)
+   *
+   * project_id is resolved from git remote origin (e.g. "askqai/claude-recall")
+   * or absolute path for non-git directories. Enables reliable message routing
+   * independent of directory basename.
+   */
+  addProjectIdColumns() {
+    const applied = this.db.prepare("SELECT 1 FROM schema_versions WHERE version = 29").get();
+    if (applied) return;
+    const sessionCols = this.db.prepare("PRAGMA table_info(sdk_sessions)").all();
+    if (!sessionCols.some((c) => c.name === "project_id")) {
+      this.db.run("ALTER TABLE sdk_sessions ADD COLUMN project_id TEXT");
+      this.db.run("CREATE INDEX IF NOT EXISTS idx_sdk_sessions_project_id ON sdk_sessions(project_id)");
+      logger.debug("DB", "Added project_id column to sdk_sessions");
+    }
+    const msgCols = this.db.prepare("PRAGMA table_info(inter_session_messages)").all();
+    if (!msgCols.some((c) => c.name === "source_project_id")) {
+      this.db.run("ALTER TABLE inter_session_messages ADD COLUMN source_project_id TEXT");
+      this.db.run("ALTER TABLE inter_session_messages ADD COLUMN target_project_id TEXT");
+      this.db.run("CREATE INDEX IF NOT EXISTS idx_ism_target_project_id ON inter_session_messages(target_project_id, status)");
+      logger.debug("DB", "Added project_id columns to inter_session_messages");
+    }
+    this.db.prepare("INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)").run(29, (/* @__PURE__ */ new Date()).toISOString());
   }
 };
 
@@ -2079,6 +2105,69 @@ var contextHandler = {
   }
 };
 
+// src/utils/project-identity.ts
+import path2 from "path";
+import { existsSync as existsSync7 } from "fs";
+import { execSync } from "child_process";
+var cache = /* @__PURE__ */ new Map();
+function normalizeGitRemoteUrl(url) {
+  let normalized = url.trim();
+  if (!normalized) return null;
+  const sshMatch = normalized.match(/^git@[^:]+:(.+?)(?:\.git)?$/);
+  if (sshMatch) return sshMatch[1].toLowerCase();
+  try {
+    const parsed = new URL(normalized);
+    let pathname = parsed.pathname;
+    if (pathname.startsWith("/")) pathname = pathname.slice(1);
+    if (pathname.endsWith(".git")) pathname = pathname.slice(0, -4);
+    if (pathname.endsWith("/")) pathname = pathname.slice(0, -1);
+    return pathname.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+function findGitRoot(dir) {
+  let current = path2.resolve(dir);
+  const root = path2.parse(current).root;
+  while (current !== root) {
+    if (existsSync7(path2.join(current, ".git"))) {
+      return current;
+    }
+    const parent = path2.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return null;
+}
+function resolveProjectId(cwd) {
+  if (!cwd || cwd.trim() === "") {
+    return "unknown-project";
+  }
+  const resolved = path2.resolve(cwd);
+  const cached = cache.get(resolved);
+  if (cached) return cached;
+  const gitRoot = findGitRoot(resolved);
+  if (gitRoot) {
+    try {
+      const remoteUrl = execSync("git remote get-url origin", {
+        cwd: gitRoot,
+        timeout: 3e3,
+        stdio: ["pipe", "pipe", "pipe"]
+      }).toString();
+      const normalized = normalizeGitRemoteUrl(remoteUrl);
+      if (normalized) {
+        cache.set(resolved, normalized);
+        logger.debug("PROJECT_ID", "Resolved via git remote", { cwd: resolved, projectId: normalized });
+        return normalized;
+      }
+    } catch {
+    }
+  }
+  cache.set(resolved, resolved);
+  logger.debug("PROJECT_ID", "Resolved via absolute path", { cwd: resolved, projectId: resolved });
+  return resolved;
+}
+
 // src/utils/privacy.ts
 var PRIVATE_TAG_PATTERN = /<(?:private|no-recall)>/i;
 var SENSITIVE_PATTERNS = [
@@ -2117,6 +2206,7 @@ var sessionInitHandler = {
       throw new Error("sessionInitHandler requires prompt");
     }
     const project = getProjectName(cwd);
+    const projectId = resolveProjectId(cwd);
     const now = /* @__PURE__ */ new Date();
     const nowIso = now.toISOString();
     const nowEpoch = Math.floor(now.getTime() / 1e3);
@@ -2125,13 +2215,13 @@ var sessionInitHandler = {
       const isPrivate = isPrivatePrompt(prompt);
       const initSession = db.transaction(() => {
         db.run(
-          `INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, started_at, started_at_epoch, status, prompt_counter)
-           VALUES (?, ?, ?, ?, 'active', 0)`,
-          [sessionId, project, nowIso, nowEpoch]
+          `INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, project_id, started_at, started_at_epoch, status, prompt_counter)
+           VALUES (?, ?, ?, ?, ?, 'active', 0)`,
+          [sessionId, project, projectId, nowIso, nowEpoch]
         );
         db.run(
-          "UPDATE sdk_sessions SET prompt_counter = prompt_counter + 1, privacy_suppressed = ? WHERE content_session_id = ?",
-          [isPrivate ? 1 : 0, sessionId]
+          "UPDATE sdk_sessions SET prompt_counter = prompt_counter + 1, privacy_suppressed = ?, project_id = COALESCE(project_id, ?) WHERE content_session_id = ?",
+          [isPrivate ? 1 : 0, projectId, sessionId]
         );
         const session = db.prepare(
           "SELECT id, prompt_counter FROM sdk_sessions WHERE content_session_id = ?"
@@ -2582,14 +2672,19 @@ var observationHandler = {
       throw new Error(`Missing cwd in PostToolUse hook input for session ${sessionId}, tool ${toolName}`);
     }
     const project = getProjectName(cwd);
+    const projectId = resolveProjectId(cwd);
     const now = /* @__PURE__ */ new Date();
     const nowEpoch = Math.floor(now.getTime() / 1e3);
     const db = openDatabase();
     try {
       db.run(
-        `INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, started_at, started_at_epoch, status)
-         VALUES (?, ?, ?, ?, 'active')`,
-        [sessionId, project, now.toISOString(), nowEpoch]
+        `INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, project_id, started_at, started_at_epoch, status)
+         VALUES (?, ?, ?, ?, ?, 'active')`,
+        [sessionId, project, projectId, now.toISOString(), nowEpoch]
+      );
+      db.run(
+        "UPDATE sdk_sessions SET project_id = COALESCE(project_id, ?) WHERE content_session_id = ?",
+        [projectId, sessionId]
       );
       const session = db.prepare(
         "SELECT prompt_counter, privacy_suppressed FROM sdk_sessions WHERE content_session_id = ?"
@@ -2744,12 +2839,12 @@ var observationHandler = {
         const msg = db.prepare(`
           SELECT id, source_project, message_type, priority, subject, body
           FROM inter_session_messages
-          WHERE target_project = ? AND status = 'approved'
+          WHERE (target_project_id = ? OR target_project = ?) AND status = 'approved'
           ORDER BY
             CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
             created_at_epoch ASC
           LIMIT 1
-        `).get(project);
+        `).get(projectId, project);
         if (msg) {
           db.prepare(
             `UPDATE inter_session_messages SET status = 'delivered', delivered_at_epoch = ? WHERE id = ?`
@@ -2876,7 +2971,7 @@ var summarizeHandler = {
 import { basename as basename2 } from "path";
 
 // src/shared/worker-utils.ts
-import path2 from "path";
+import path3 from "path";
 import { homedir as homedir6 } from "os";
 import { readFileSync as readFileSync8 } from "fs";
 
@@ -2939,14 +3034,14 @@ ${message}`;
 }
 
 // src/shared/worker-utils.ts
-var MARKETPLACE_ROOT = path2.join(homedir6(), ".claude", "plugins", "marketplaces", "askqai");
+var MARKETPLACE_ROOT = path3.join(homedir6(), ".claude", "plugins", "marketplaces", "askqai");
 var HEALTH_CHECK_TIMEOUT_MS = getTimeout(HOOK_TIMEOUTS.HEALTH_CHECK);
 var cachedPort = null;
 function getWorkerPort() {
   if (cachedPort !== null) {
     return cachedPort;
   }
-  const settingsPath = path2.join(SettingsDefaultsManager.get("CLAUDE_RECALL_DATA_DIR"), "settings.json");
+  const settingsPath = path3.join(SettingsDefaultsManager.get("CLAUDE_RECALL_DATA_DIR"), "settings.json");
   const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
   cachedPort = parseInt(settings.CLAUDE_RECALL_WORKER_PORT, 10);
   return cachedPort;
@@ -2957,7 +3052,7 @@ async function isWorkerHealthy() {
   return response.ok;
 }
 function getPluginVersion() {
-  const packageJsonPath = path2.join(MARKETPLACE_ROOT, "package.json");
+  const packageJsonPath = path3.join(MARKETPLACE_ROOT, "package.json");
   const packageJson = JSON.parse(readFileSync8(packageJsonPath, "utf-8"));
   return packageJson.version;
 }

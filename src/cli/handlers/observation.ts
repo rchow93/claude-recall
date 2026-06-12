@@ -10,6 +10,7 @@
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
 import { openDatabase } from '../../services/sqlite/DirectDB.js';
 import { getProjectName } from '../../utils/project-name.js';
+import { resolveProjectId } from '../../utils/project-identity.js';
 import { logger } from '../../utils/logger.js';
 import { readFileSync } from 'fs';
 import { computeRelevanceScore } from './relevance.js';
@@ -151,16 +152,22 @@ export const observationHandler: EventHandler = {
     }
 
     const project = getProjectName(cwd);
+    const projectId = resolveProjectId(cwd);
     const now = new Date();
     const nowEpoch = Math.floor(now.getTime() / 1000);
     const db = openDatabase();
 
     try {
-      // Ensure session exists
+      // Ensure session exists (project_id populated for canonical identity)
       db.run(
-        `INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, started_at, started_at_epoch, status)
-         VALUES (?, ?, ?, ?, 'active')`,
-        [sessionId, project, now.toISOString(), nowEpoch]
+        `INSERT OR IGNORE INTO sdk_sessions (content_session_id, project, project_id, started_at, started_at_epoch, status)
+         VALUES (?, ?, ?, ?, ?, 'active')`,
+        [sessionId, project, projectId, now.toISOString(), nowEpoch]
+      );
+      // Backfill project_id on existing sessions that don't have it
+      db.run(
+        'UPDATE sdk_sessions SET project_id = COALESCE(project_id, ?) WHERE content_session_id = ?',
+        [projectId, sessionId]
       );
 
       // Get current prompt number and privacy state for this session
@@ -343,16 +350,17 @@ export const observationHandler: EventHandler = {
       // Check for approved inter-session messages targeting this project.
       // Uses a transaction to atomically claim the message (prevent duplicate delivery
       // when multiple PostToolUse hooks fire concurrently).
+      // Matches by canonical project_id first, then falls back to display name for old messages.
       const pendingMsg = db.transaction(() => {
         const msg = db.prepare(`
           SELECT id, source_project, message_type, priority, subject, body
           FROM inter_session_messages
-          WHERE target_project = ? AND status = 'approved'
+          WHERE (target_project_id = ? OR target_project = ?) AND status = 'approved'
           ORDER BY
             CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
             created_at_epoch ASC
           LIMIT 1
-        `).get(project) as { id: number; source_project: string; message_type: string; priority: string; subject: string | null; body: string } | null;
+        `).get(projectId, project) as { id: number; source_project: string; message_type: string; priority: string; subject: string | null; body: string } | null;
 
         if (msg) {
           db.prepare(
