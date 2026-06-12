@@ -24,10 +24,14 @@ var claudeCodeAdapter = {
       toolName: r.tool_name,
       toolInput: r.tool_input,
       toolResponse: r.tool_response,
-      transcriptPath: r.transcript_path
+      transcriptPath: r.transcript_path,
+      stopHookActive: r.stop_hook_active === true
     };
   },
   formatOutput(result) {
+    if (result.decision === "block") {
+      return { decision: "block", reason: result.reason ?? "" };
+    }
     const output = { continue: result.continue ?? true, suppressOutput: result.suppressOutput ?? true };
     if (result.hookSpecificOutput) {
       output.hookSpecificOutput = result.hookSpecificOutput;
@@ -2923,7 +2927,59 @@ function extractText2(content) {
 }
 var summarizeHandler = {
   async execute(input) {
-    const { sessionId, cwd, transcriptPath } = input;
+    const { sessionId, cwd, transcriptPath, stopHookActive } = input;
+    if (!stopHookActive && cwd) {
+      const projectId = resolveProjectId(cwd);
+      const project2 = getProjectName(cwd);
+      const msgDb = openDatabase();
+      try {
+        const nowEpoch2 = Math.floor(Date.now() / 1e3);
+        const pendingMsg = msgDb.transaction(() => {
+          const msg = msgDb.prepare(`
+            SELECT id, source_project, message_type, priority, subject, body
+            FROM inter_session_messages
+            WHERE (target_project_id = ? OR target_project = ?) AND status = 'approved'
+            ORDER BY
+              CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
+              created_at_epoch ASC
+            LIMIT 1
+          `).get(projectId, project2);
+          if (msg) {
+            msgDb.prepare(
+              `UPDATE inter_session_messages SET status = 'delivered', delivered_at_epoch = ? WHERE id = ?`
+            ).run(nowEpoch2, msg.id);
+          }
+          return msg;
+        })();
+        if (pendingMsg) {
+          const lines2 = [
+            `You have a new inter-session message from ${pendingMsg.source_project}.`,
+            `Type: ${pendingMsg.message_type} | Priority: ${pendingMsg.priority} | Message ID: ${pendingMsg.id}`,
+            pendingMsg.subject ? `Subject: ${pendingMsg.subject}` : null,
+            "",
+            pendingMsg.body,
+            "",
+            `To respond, use the claude-recall MCP tool: reply_message(message_id=${pendingMsg.id}, response="your response here")`
+          ].filter((l) => l !== null).join("\n");
+          logger.info("HOOK", `Stop hook delivering message #${pendingMsg.id} from ${pendingMsg.source_project}`);
+          const banner = [
+            "",
+            "\x1B[36m\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\x1B[0m",
+            `\x1B[36m\u2551\x1B[0m  \x1B[1m\u{1F4E8} Inter-Session Message Delivered\x1B[0m`,
+            `\x1B[36m\u2551\x1B[0m  From: \x1B[33m${pendingMsg.source_project}\x1B[0m  \u2192  To: \x1B[33m${project2}\x1B[0m`,
+            `\x1B[36m\u2551\x1B[0m  Type: ${pendingMsg.message_type}  |  Priority: ${pendingMsg.priority}  |  ID: #${pendingMsg.id}`,
+            pendingMsg.subject ? `\x1B[36m\u2551\x1B[0m  Subject: \x1B[1m${pendingMsg.subject}\x1B[0m` : null,
+            `\x1B[36m\u2551\x1B[0m  Body: ${pendingMsg.body.length > 120 ? pendingMsg.body.slice(0, 120) + "\u2026" : pendingMsg.body}`,
+            "\x1B[36m\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D\x1B[0m",
+            ""
+          ].filter((l) => l !== null).join("\n");
+          process.stderr.write(banner);
+          return { decision: "block", reason: lines2 };
+        }
+      } finally {
+        msgDb.close();
+      }
+    }
     if (!transcriptPath || !sessionId) {
       return { continue: true, suppressOutput: true };
     }

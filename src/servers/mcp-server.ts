@@ -28,10 +28,13 @@ import { openDatabase } from '../services/sqlite/DirectDB.js';
 import { parseDateExpression } from '../utils/date-parse.js';
 import { decrypt } from '../services/encryption.js';
 import { getEncryptionKey, encryptionEnabled } from '../services/key-management.js';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, writeFileSync, watch, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { matchesAutoApproveRule } from '../utils/message-rules.js';
+import { consumeSignalFile, writeSignalFile } from '../utils/push-signal.js';
+import { resolveProjectId } from '../utils/project-identity.js';
+import { getProjectName } from '../utils/project-name.js';
 
 import type { Database, Statement } from 'bun:sqlite';
 
@@ -741,6 +744,9 @@ function handleSendMessage(args: Record<string, any>): { content: Array<{ type: 
       `UPDATE inter_session_messages SET status = 'approved', approved_at_epoch = ? WHERE id = ?`
     ).run(nowEpoch, messageId);
     autoApproved = true;
+    try {
+      writeSignalFile(target.projectId);
+    } catch { /* signal write is best-effort */ }
   }
 
   const parts = [
@@ -1121,6 +1127,131 @@ async function cleanup() {
 
 process.on('SIGTERM', cleanup);
 process.on('SIGINT', cleanup);
+
+// After MCP handshake: log capabilities + start push-delivery watcher (WOR-156)
+server.oninitialized = () => {
+  const caps = server.getClientCapabilities();
+  const capsPath = join(homedir(), '.claude-recall', 'client-capabilities.json');
+  try {
+    writeFileSync(capsPath, JSON.stringify(caps, null, 2), 'utf-8');
+    logger.info('SYSTEM', `Client capabilities written to ${capsPath}`);
+  } catch { /* best effort */ }
+
+  // WOR-156: Proactive elicitation — watch for signal files and pop a form
+  if (caps?.elicitation?.form) {
+    // Use MCP roots to determine which project this session serves
+    server.listRoots().then((rootsResult) => {
+      const roots = rootsResult?.roots ?? [];
+      logger.info('SYSTEM', `Push watcher: listRoots returned ${roots.length} root(s): ${JSON.stringify(roots)}`);
+
+      // Extract CWD from the first root URI (file:///Users/...)
+      let cwd: string | null = null;
+      for (const root of roots) {
+        if (root.uri?.startsWith('file://')) {
+          try {
+            cwd = decodeURIComponent(new URL(root.uri).pathname);
+            break;
+          } catch { /* continue */ }
+        }
+      }
+
+      if (!cwd) {
+        logger.info('SYSTEM', 'Push watcher: no file:// root found, skipping');
+        return;
+      }
+
+      // Resolve project identity from CWD
+      const projectId = resolveProjectId(cwd);
+      const project = getProjectName(cwd);
+
+      startPushWatcher(project, projectId);
+    }).catch((err: any) => {
+      logger.error('SYSTEM', `Push watcher: listRoots failed: ${err?.message || err}`);
+
+      // Fallback: use most recent active session from DB
+      const sessionRow = db.prepare(
+        `SELECT project, project_id FROM sdk_sessions WHERE status = 'active' ORDER BY started_at_epoch DESC LIMIT 1`
+      ).get() as { project: string; project_id: string | null } | null;
+
+      if (sessionRow) {
+        const project = sessionRow.project;
+        const projectId = sessionRow.project_id ?? project;
+        startPushWatcher(project, projectId);
+      } else {
+        logger.info('SYSTEM', 'Push watcher: no active session found, skipping');
+      }
+    });
+  } else {
+    logger.info('SYSTEM', 'Client does not support form elicitation, push watcher skipped');
+  }
+};
+
+function startPushWatcher(project: string, projectId: string): void {
+    const pushDir = join(homedir(), '.claude-recall', 'push');
+    try {
+      if (!existsSync(pushDir)) {
+        mkdirSync(pushDir, { recursive: true });
+      }
+
+      logger.info('SYSTEM', `Push watcher started for project="${project}" (id=${projectId}), watching ${pushDir}`);
+
+      watch(pushDir, (eventType, filename) => {
+        if (!filename?.endsWith('.signal')) return;
+
+        // Check if this signal is for us
+        if (!consumeSignalFile(projectId)) return;
+
+        logger.info('SYSTEM', `Push watcher: signal consumed for ${project}, triggering elicitation`);
+
+        // Find the pending message
+        const pendingMsg = db.prepare(`
+          SELECT id, source_project, message_type, priority, subject, body
+          FROM inter_session_messages
+          WHERE (target_project_id = ? OR target_project = ?) AND status = 'approved'
+          ORDER BY
+            CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
+            created_at_epoch ASC
+          LIMIT 1
+        `).get(projectId, project) as { id: number; source_project: string; message_type: string; priority: string; subject: string | null; body: string } | null;
+
+        if (!pendingMsg) {
+          logger.info('SYSTEM', 'Push watcher: signal consumed but no approved message found');
+          return;
+        }
+
+        const msgSummary = [
+          `From: ${pendingMsg.source_project}`,
+          `Type: ${pendingMsg.message_type} | Priority: ${pendingMsg.priority}`,
+          pendingMsg.subject ? `Subject: ${pendingMsg.subject}` : null,
+          `\n${pendingMsg.body}`,
+        ].filter(Boolean).join('\n');
+
+        // Notification only — message stays 'approved' so PostToolUse hook delivers it
+        // into Claude's context on the user's next interaction
+        server.elicitInput({
+          mode: 'form' as const,
+          message: `📨 Inter-Session Message from ${pendingMsg.source_project}\n\n${msgSummary}\n\nType anything to deliver this message to Claude.`,
+          requestedSchema: {
+            type: 'object' as const,
+            properties: {
+              acknowledged: {
+                type: 'boolean' as const,
+                title: 'Acknowledged',
+                description: 'Message notification received',
+                default: true,
+              },
+            },
+          },
+        }).then((result) => {
+          logger.info('SYSTEM', `Elicitation notification result for #${pendingMsg.id}: action=${result.action}`);
+        }).catch((err) => {
+          logger.error('SYSTEM', `Push elicitation failed: ${err?.message || err}`);
+        });
+      });
+    } catch (err) {
+      logger.error('SYSTEM', `Push watcher setup failed: ${err}`);
+    }
+}
 
 // Start the server
 async function main() {

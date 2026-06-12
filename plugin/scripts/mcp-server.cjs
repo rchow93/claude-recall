@@ -3223,8 +3223,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path) {
-      let input = path;
+    function removeDotSegments(path3) {
+      let input = path3;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -3423,8 +3423,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path && path !== "/" ? path : void 0;
+        const [path3, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path3 && path3 !== "/" ? path3 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -7438,8 +7438,8 @@ function getErrorMap() {
 
 // node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue = (params) => {
-  const { data, path, errorMaps, issueData } = params;
-  const fullPath = [...path, ...issueData.path || []];
+  const { data, path: path3, errorMaps, issueData } = params;
+  const fullPath = [...path3, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -7554,11 +7554,11 @@ var errorUtil;
 
 // node_modules/zod/v3/types.js
 var ParseInputLazyPath = class {
-  constructor(parent, value, path, key) {
+  constructor(parent, value, path3, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path;
+    this._path = path3;
     this._key = key;
   }
   get path() {
@@ -11202,10 +11202,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path) {
-  if (!path)
+function getElementAtPath(obj, path3) {
+  if (!path3)
     return obj;
-  return path.reduce((acc, key) => acc?.[key], obj);
+  return path3.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -11588,11 +11588,11 @@ function aborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path, issues) {
+function prefixIssues(path3, issues) {
   return issues.map((iss) => {
     var _a2;
     (_a2 = iss).path ?? (_a2.path = []);
-    iss.path.unshift(path);
+    iss.path.unshift(path3);
     return iss;
   });
 }
@@ -22008,6 +22008,11 @@ function getEncryptionKey() {
   return _cachedKey;
 }
 
+// src/servers/mcp-server.ts
+var import_fs8 = require("fs");
+var import_path9 = require("path");
+var import_os7 = require("os");
+
 // src/utils/message-rules.ts
 var import_fs5 = require("fs");
 var import_path5 = require("path");
@@ -22022,12 +22027,12 @@ function getRulesPath() {
 }
 function loadAutoApproveRules() {
   try {
-    const path = getRulesPath();
-    if (!(0, import_fs5.existsSync)(path)) return [];
-    const stat = (0, import_fs5.statSync)(path);
+    const path3 = getRulesPath();
+    if (!(0, import_fs5.existsSync)(path3)) return [];
+    const stat = (0, import_fs5.statSync)(path3);
     const mtime = stat.mtimeMs;
     if (rulesCache && mtime === rulesMtime) return rulesCache.auto_approve ?? [];
-    const raw = (0, import_fs5.readFileSync)(path, "utf-8");
+    const raw = (0, import_fs5.readFileSync)(path3, "utf-8");
     rulesCache = JSON.parse(raw);
     rulesMtime = mtime;
     return rulesCache.auto_approve ?? [];
@@ -22048,6 +22053,125 @@ function matchesRules(rules, from, to, type, priority) {
     if (fromMatch && toMatch && typeMatch && priorityMatch) return true;
   }
   return false;
+}
+
+// src/utils/push-signal.ts
+var import_fs6 = require("fs");
+var import_path6 = require("path");
+var import_os6 = require("os");
+var import_crypto3 = require("crypto");
+var PUSH_DIR = (0, import_path6.join)((0, import_os6.homedir)(), ".claude-recall", "push");
+function ensurePushDir() {
+  if (!(0, import_fs6.existsSync)(PUSH_DIR)) {
+    (0, import_fs6.mkdirSync)(PUSH_DIR, { recursive: true });
+  }
+}
+function safeFilename(projectId) {
+  return (0, import_crypto3.createHash)("md5").update(projectId).digest("hex");
+}
+function writeSignalFile(targetProjectId) {
+  ensurePushDir();
+  const signalPath = (0, import_path6.join)(PUSH_DIR, `${safeFilename(targetProjectId)}.signal`);
+  (0, import_fs6.writeFileSync)(signalPath, String(Date.now()), "utf-8");
+}
+function consumeSignalFile(projectId) {
+  const signalPath = (0, import_path6.join)(PUSH_DIR, `${safeFilename(projectId)}.signal`);
+  if ((0, import_fs6.existsSync)(signalPath)) {
+    try {
+      (0, import_fs6.unlinkSync)(signalPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const allSignal = (0, import_path6.join)(PUSH_DIR, "all.signal");
+  if ((0, import_fs6.existsSync)(allSignal)) {
+    try {
+      (0, import_fs6.unlinkSync)(allSignal);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+// src/utils/project-identity.ts
+var import_path7 = __toESM(require("path"), 1);
+var import_fs7 = require("fs");
+var import_child_process = require("child_process");
+var cache = /* @__PURE__ */ new Map();
+function normalizeGitRemoteUrl(url2) {
+  let normalized = url2.trim();
+  if (!normalized) return null;
+  const sshMatch = normalized.match(/^git@[^:]+:(.+?)(?:\.git)?$/);
+  if (sshMatch) return sshMatch[1].toLowerCase();
+  try {
+    const parsed = new URL(normalized);
+    let pathname = parsed.pathname;
+    if (pathname.startsWith("/")) pathname = pathname.slice(1);
+    if (pathname.endsWith(".git")) pathname = pathname.slice(0, -4);
+    if (pathname.endsWith("/")) pathname = pathname.slice(0, -1);
+    return pathname.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+function findGitRoot(dir) {
+  let current = import_path7.default.resolve(dir);
+  const root = import_path7.default.parse(current).root;
+  while (current !== root) {
+    if ((0, import_fs7.existsSync)(import_path7.default.join(current, ".git"))) {
+      return current;
+    }
+    const parent = import_path7.default.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return null;
+}
+function resolveProjectId(cwd) {
+  if (!cwd || cwd.trim() === "") {
+    return "unknown-project";
+  }
+  const resolved = import_path7.default.resolve(cwd);
+  const cached2 = cache.get(resolved);
+  if (cached2) return cached2;
+  const gitRoot = findGitRoot(resolved);
+  if (gitRoot) {
+    try {
+      const remoteUrl = (0, import_child_process.execSync)("git remote get-url origin", {
+        cwd: gitRoot,
+        timeout: 3e3,
+        stdio: ["pipe", "pipe", "pipe"]
+      }).toString();
+      const normalized = normalizeGitRemoteUrl(remoteUrl);
+      if (normalized) {
+        cache.set(resolved, normalized);
+        logger.debug("PROJECT_ID", "Resolved via git remote", { cwd: resolved, projectId: normalized });
+        return normalized;
+      }
+    } catch {
+    }
+  }
+  cache.set(resolved, resolved);
+  logger.debug("PROJECT_ID", "Resolved via absolute path", { cwd: resolved, projectId: resolved });
+  return resolved;
+}
+
+// src/utils/project-name.ts
+var import_path8 = __toESM(require("path"), 1);
+function getProjectName(cwd) {
+  if (!cwd || cwd.trim() === "") {
+    logger.warn("PROJECT_NAME", "Empty cwd provided, using fallback", { cwd });
+    return "unknown-project";
+  }
+  const basename2 = import_path8.default.basename(cwd);
+  if (basename2 === "") {
+    logger.warn("PROJECT_NAME", "Root directory detected, using fallback", { cwd });
+    return "unknown-project";
+  }
+  return basename2;
 }
 
 // src/servers/mcp-server.ts
@@ -22555,6 +22679,10 @@ function handleSendMessage(args) {
       `UPDATE inter_session_messages SET status = 'approved', approved_at_epoch = ? WHERE id = ?`
     ).run(nowEpoch, messageId);
     autoApproved = true;
+    try {
+      writeSignalFile(target.projectId);
+    } catch {
+    }
   }
   const parts = [
     `Message #${messageId} sent to **${to}**.`,
@@ -22886,6 +23014,111 @@ async function cleanup() {
 }
 process.on("SIGTERM", cleanup);
 process.on("SIGINT", cleanup);
+server.oninitialized = () => {
+  const caps = server.getClientCapabilities();
+  const capsPath = (0, import_path9.join)((0, import_os7.homedir)(), ".claude-recall", "client-capabilities.json");
+  try {
+    (0, import_fs8.writeFileSync)(capsPath, JSON.stringify(caps, null, 2), "utf-8");
+    logger.info("SYSTEM", `Client capabilities written to ${capsPath}`);
+  } catch {
+  }
+  if (caps?.elicitation?.form) {
+    server.listRoots().then((rootsResult) => {
+      const roots = rootsResult?.roots ?? [];
+      logger.info("SYSTEM", `Push watcher: listRoots returned ${roots.length} root(s): ${JSON.stringify(roots)}`);
+      let cwd = null;
+      for (const root of roots) {
+        if (root.uri?.startsWith("file://")) {
+          try {
+            cwd = decodeURIComponent(new URL(root.uri).pathname);
+            break;
+          } catch {
+          }
+        }
+      }
+      if (!cwd) {
+        logger.info("SYSTEM", "Push watcher: no file:// root found, skipping");
+        return;
+      }
+      const projectId = resolveProjectId(cwd);
+      const project = getProjectName(cwd);
+      startPushWatcher(project, projectId);
+    }).catch((err) => {
+      logger.error("SYSTEM", `Push watcher: listRoots failed: ${err?.message || err}`);
+      const sessionRow = db.prepare(
+        `SELECT project, project_id FROM sdk_sessions WHERE status = 'active' ORDER BY started_at_epoch DESC LIMIT 1`
+      ).get();
+      if (sessionRow) {
+        const project = sessionRow.project;
+        const projectId = sessionRow.project_id ?? project;
+        startPushWatcher(project, projectId);
+      } else {
+        logger.info("SYSTEM", "Push watcher: no active session found, skipping");
+      }
+    });
+  } else {
+    logger.info("SYSTEM", "Client does not support form elicitation, push watcher skipped");
+  }
+};
+function startPushWatcher(project, projectId) {
+  const pushDir = (0, import_path9.join)((0, import_os7.homedir)(), ".claude-recall", "push");
+  try {
+    if (!(0, import_fs8.existsSync)(pushDir)) {
+      (0, import_fs8.mkdirSync)(pushDir, { recursive: true });
+    }
+    logger.info("SYSTEM", `Push watcher started for project="${project}" (id=${projectId}), watching ${pushDir}`);
+    (0, import_fs8.watch)(pushDir, (eventType, filename) => {
+      if (!filename?.endsWith(".signal")) return;
+      if (!consumeSignalFile(projectId)) return;
+      logger.info("SYSTEM", `Push watcher: signal consumed for ${project}, triggering elicitation`);
+      const pendingMsg = db.prepare(`
+          SELECT id, source_project, message_type, priority, subject, body
+          FROM inter_session_messages
+          WHERE (target_project_id = ? OR target_project = ?) AND status = 'approved'
+          ORDER BY
+            CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
+            created_at_epoch ASC
+          LIMIT 1
+        `).get(projectId, project);
+      if (!pendingMsg) {
+        logger.info("SYSTEM", "Push watcher: signal consumed but no approved message found");
+        return;
+      }
+      const msgSummary = [
+        `From: ${pendingMsg.source_project}`,
+        `Type: ${pendingMsg.message_type} | Priority: ${pendingMsg.priority}`,
+        pendingMsg.subject ? `Subject: ${pendingMsg.subject}` : null,
+        `
+${pendingMsg.body}`
+      ].filter(Boolean).join("\n");
+      server.elicitInput({
+        mode: "form",
+        message: `\u{1F4E8} Inter-Session Message from ${pendingMsg.source_project}
+
+${msgSummary}
+
+Type anything to deliver this message to Claude.`,
+        requestedSchema: {
+          type: "object",
+          properties: {
+            acknowledged: {
+              type: "boolean",
+              title: "Acknowledged",
+              description: "Message notification received",
+              default: true
+            }
+          }
+        }
+      }).then((result) => {
+        logger.info("SYSTEM", `Elicitation notification result for #${pendingMsg.id}: action=${result.action}`);
+      }).catch((err) => {
+        logger.error("SYSTEM", `Push elicitation failed: ${err?.message || err}`);
+      });
+    });
+  } catch (err) {
+    logger.error("SYSTEM", `Push watcher setup failed: ${err}`);
+  }
+}
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);

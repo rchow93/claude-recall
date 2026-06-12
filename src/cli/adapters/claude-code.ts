@@ -13,9 +13,13 @@ export const claudeCodeAdapter: PlatformAdapter = {
       toolInput: r.tool_input,
       toolResponse: r.tool_response,
       transcriptPath: r.transcript_path,
+      stopHookActive: r.stop_hook_active === true,
     };
   },
   formatOutput(result) {
+    if (result.decision === 'block') {
+      return { decision: 'block', reason: result.reason ?? '' };
+    }
     const output: any = { continue: result.continue ?? true, suppressOutput: result.suppressOutput ?? true };
     if (result.hookSpecificOutput) {
       output.hookSpecificOutput = result.hookSpecificOutput;

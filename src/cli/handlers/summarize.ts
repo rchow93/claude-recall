@@ -9,6 +9,7 @@
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
 import { openDatabase } from '../../services/sqlite/DirectDB.js';
 import { getProjectName } from '../../utils/project-name.js';
+import { resolveProjectId } from '../../utils/project-identity.js';
 import { logger } from '../../utils/logger.js';
 import { readFileSync } from 'fs';
 import { encrypt } from '../../services/encryption.js';
@@ -41,7 +42,67 @@ function extractText(content: unknown): string {
 
 export const summarizeHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
-    const { sessionId, cwd, transcriptPath } = input;
+    const { sessionId, cwd, transcriptPath, stopHookActive } = input;
+
+    // Check for pending inter-session messages on every stop.
+    // Only when stop_hook_active is false (prevents infinite block loops).
+    if (!stopHookActive && cwd) {
+      const projectId = resolveProjectId(cwd);
+      const project = getProjectName(cwd);
+      const msgDb = openDatabase();
+      try {
+        const nowEpoch = Math.floor(Date.now() / 1000);
+        const pendingMsg = msgDb.transaction(() => {
+          const msg = msgDb.prepare(`
+            SELECT id, source_project, message_type, priority, subject, body
+            FROM inter_session_messages
+            WHERE (target_project_id = ? OR target_project = ?) AND status = 'approved'
+            ORDER BY
+              CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
+              created_at_epoch ASC
+            LIMIT 1
+          `).get(projectId, project) as { id: number; source_project: string; message_type: string; priority: string; subject: string | null; body: string } | null;
+
+          if (msg) {
+            msgDb.prepare(
+              `UPDATE inter_session_messages SET status = 'delivered', delivered_at_epoch = ? WHERE id = ?`
+            ).run(nowEpoch, msg.id);
+          }
+          return msg;
+        })();
+
+        if (pendingMsg) {
+          const lines = [
+            `You have a new inter-session message from ${pendingMsg.source_project}.`,
+            `Type: ${pendingMsg.message_type} | Priority: ${pendingMsg.priority} | Message ID: ${pendingMsg.id}`,
+            pendingMsg.subject ? `Subject: ${pendingMsg.subject}` : null,
+            '',
+            pendingMsg.body,
+            '',
+            `To respond, use the claude-recall MCP tool: reply_message(message_id=${pendingMsg.id}, response="your response here")`,
+          ].filter(l => l !== null).join('\n');
+
+          logger.info('HOOK', `Stop hook delivering message #${pendingMsg.id} from ${pendingMsg.source_project}`);
+
+          const banner = [
+            '',
+            '\x1b[36m╔══════════════════════════════════════════════════════════════╗\x1b[0m',
+            `\x1b[36m║\x1b[0m  \x1b[1m📨 Inter-Session Message Delivered\x1b[0m`,
+            `\x1b[36m║\x1b[0m  From: \x1b[33m${pendingMsg.source_project}\x1b[0m  →  To: \x1b[33m${project}\x1b[0m`,
+            `\x1b[36m║\x1b[0m  Type: ${pendingMsg.message_type}  |  Priority: ${pendingMsg.priority}  |  ID: #${pendingMsg.id}`,
+            pendingMsg.subject ? `\x1b[36m║\x1b[0m  Subject: \x1b[1m${pendingMsg.subject}\x1b[0m` : null,
+            `\x1b[36m║\x1b[0m  Body: ${pendingMsg.body.length > 120 ? pendingMsg.body.slice(0, 120) + '…' : pendingMsg.body}`,
+            '\x1b[36m╚══════════════════════════════════════════════════════════════╝\x1b[0m',
+            '',
+          ].filter(l => l !== null).join('\n');
+          process.stderr.write(banner);
+
+          return { decision: 'block', reason: lines };
+        }
+      } finally {
+        msgDb.close();
+      }
+    }
 
     if (!transcriptPath || !sessionId) {
       return { continue: true, suppressOutput: true };

@@ -7,6 +7,7 @@ export interface NormalizedHookInput {
   toolInput?: unknown;
   toolResponse?: unknown;
   transcriptPath?: string;
+  stopHookActive?: boolean;
   // Cursor-specific fields
   filePath?: string;   // afterFileEdit
   edits?: unknown[];   // afterFileEdit
@@ -17,6 +18,8 @@ export interface HookResult {
   suppressOutput?: boolean;
   hookSpecificOutput?: { hookEventName: string; additionalContext: string };
   exitCode?: number;
+  decision?: 'block';
+  reason?: string;
 }
 
 export interface PlatformAdapter {
