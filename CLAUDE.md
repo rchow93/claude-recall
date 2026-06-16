@@ -37,7 +37,7 @@ bun test                 # run tests
 - `.claude-plugin/plugin.json` — Plugin metadata (version must match package.json)
 - `.claude-plugin/marketplace.json` — Marketplace listing
 - `plugin/hooks/hooks.json` — Hook definitions using `${CLAUDE_PLUGIN_ROOT}`
-- `.mcp.json` — MCP server registration
+- `plugin/.mcp.json` — MCP server registration (used by installed plugin)
 
 ## Version Bumping
 Update version in ALL three places: `package.json`, `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`
