@@ -1,5 +1,7 @@
 # Claude-Recall
 
+> **Note:** Both this repo and [askqai/claude-recall](https://github.com/askqai/claude-recall) are maintained by the same author. The most up-to-date code lives in the **askqai** org repo — this fork is kept here for visibility.
+
 Persistent memory system for [Claude Code](https://claude.com/claude-code). Automatically captures every tool use, stores user prompts, and injects relevant context into future sessions.
 
 All data stays local in a single SQLite database. No background daemons, no network services, no subprocess spawning.
