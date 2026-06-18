@@ -22792,9 +22792,20 @@ function handleReplyMessage(args) {
     ) VALUES (?, ?, ?, ?, ?, 'reply', 'normal', ?, ?, ?, 'pending_approval', ?, 86400)
   `).run(resolved.displayName, resolved.projectId, sourceSessionId, msg.source_project, msg.source_project_id, msg.subject ? `Re: ${msg.subject}` : null, response, messageId, nowEpoch);
   const replyId = Number(replyResult.lastInsertRowid);
+  let autoApproved = false;
+  if (matchesAutoApproveRule(from, msg.source_project, "reply", "normal")) {
+    cachedPrepare(
+      `UPDATE inter_session_messages SET status = 'approved', approved_at_epoch = ? WHERE id = ?`
+    ).run(nowEpoch, replyId);
+    autoApproved = true;
+    try {
+      writeSignalFile(msg.source_project_id ?? msg.source_project);
+    } catch {
+    }
+  }
   const parts = [
     `Message #${messageId} marked as **completed** with your response.`,
-    `Reply message #${replyId} sent back to **${msg.source_project}** (pending approval).`
+    autoApproved ? `Reply #${replyId} **auto-approved** and sent to **${msg.source_project}**. They'll receive it on their next tool use.` : `Reply #${replyId} sent to **${msg.source_project}** (pending approval).`
   ];
   return { content: [{ type: "text", text: parts.join("\n") }] };
 }

@@ -892,9 +892,22 @@ function handleReplyMessage(args: Record<string, any>): { content: Array<{ type:
 
   const replyId = Number(replyResult.lastInsertRowid);
 
+  let autoApproved = false;
+  if (matchesAutoApproveRule(from, msg.source_project, 'reply', 'normal')) {
+    cachedPrepare(
+      `UPDATE inter_session_messages SET status = 'approved', approved_at_epoch = ? WHERE id = ?`
+    ).run(nowEpoch, replyId);
+    autoApproved = true;
+    try {
+      writeSignalFile(msg.source_project_id ?? msg.source_project);
+    } catch { /* signal write is best-effort */ }
+  }
+
   const parts = [
     `Message #${messageId} marked as **completed** with your response.`,
-    `Reply message #${replyId} sent back to **${msg.source_project}** (pending approval).`,
+    autoApproved
+      ? `Reply #${replyId} **auto-approved** and sent to **${msg.source_project}**. They'll receive it on their next tool use.`
+      : `Reply #${replyId} sent to **${msg.source_project}** (pending approval).`,
   ];
 
   return { content: [{ type: 'text' as const, text: parts.join('\n') }] };
